@@ -21,7 +21,7 @@
  */
 
 import { describe, test, assert, runAndExit, measure } from './harness.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { EventBus, Events } from '../src/core/bus.js';
 import { CAM, MOVE, PERF, SAVE, STEALTH } from '../src/core/constants.js';
 import { Vec3 } from '../src/core/math.js';
@@ -1238,7 +1238,8 @@ describe('runtime — input attachment', () => {
  * between two files that are never imported together.
  * ---------------------------------------------------------------------- */
 
-const PAGE = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+const PAGE_URL = new URL('../index.html', import.meta.url);
+const PAGE = readFileSync(PAGE_URL, 'utf8');
 
 /** Every `game.x.y(` and `game.x(` call in the page, optional chaining included. */
 function pageCallsOnGame(source) {
@@ -1336,6 +1337,52 @@ describe('runtime — the page/runtime contract', () => {
     assert.gt(used.size, 8, 'the page must subscribe to events');
     const missing = [...used].filter((name) => !(name in Events));
     assert.deepEqual(missing, [], `index.html listens for events that do not exist: ${missing.join(', ')}`);
+  });
+
+  test('VIII6 · every element the page looks up exists in its own markup', () => {
+    // A $("name") that finds nothing returns null, and the null is not noticed until
+    // something assigns to .textContent - inside boot()'s try block, where it becomes a
+    // line of orange text on the boot screen and a game that never starts. Checked as
+    // text because there is no DOM here to ask.
+    const ids = new Set([...PAGE.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
+    const wanted = new Set([...PAGE.matchAll(/\$\('([^']+)'\)/g)].map((m) => m[1]));
+    assert.gt(wanted.size, 20, 'the page must look its elements up');
+    const missing = [...wanted].filter((w) => !ids.has(w));
+    assert.deepEqual(missing, [], `$('...') targets absent from the markup: ${missing.join(', ')}`);
+  });
+
+  test('VIII7 · every querySelector the page uses addresses something real', () => {
+    // Half a selector is as broken as a whole one: #dialogue .lst finds nothing and
+    // returns null just as surely as a misspelled id, and it is the easier typo to make
+    // when a panel is being edited.
+    const ids = new Set([...PAGE.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
+    const classes = new Set([...PAGE.matchAll(/\bclass="([^"]+)"/g)].flatMap((m) => m[1].split(/\s+/)));
+    const bad = [];
+    const selectors = [...PAGE.matchAll(/querySelector\('([^']+)'\)/g)].map((m) => m[1]);
+    assert.gt(selectors.length, 8, 'the page must query into its panels');
+    for (const sel of selectors) {
+      // Split on whitespace for descendant steps, then on the sigils within a step:
+      // ".bar.health" is one element carrying two classes, not an element inside an
+      // element, and treating it as the latter asks for a class literally named
+      // "bar.health" and reports a selector that works perfectly.
+      for (const part of sel.split(/\s+/)) {
+        for (const token of part.match(/[#.][\w-]+/g) ?? []) {
+          const name = token.slice(1);
+          if (token[0] === '#' && !ids.has(name)) bad.push(`${sel} — no id "${name}"`);
+          else if (token[0] === '.' && !classes.has(name)) bad.push(`${sel} — no class "${name}"`);
+        }
+      }
+    }
+    assert.deepEqual(bad, [], `selectors that address nothing:\n  ${bad.join('\n  ')}`);
+  });
+
+  test('VIII8 · every module the page imports exists', () => {
+    // A bad import path is a blank page with one line in the console, and there is no
+    // browser here to read it.
+    const imports = [...PAGE.matchAll(/from '(\.[^']+)'/g)].map((m) => m[1]);
+    assert.gt(imports.length, 0, 'the page must import the runtime');
+    const missing = imports.filter((spec) => !existsSync(new URL(spec, PAGE_URL)));
+    assert.deepEqual(missing, [], `imports that resolve to nothing: ${missing.join(', ')}`);
   });
 });
 
