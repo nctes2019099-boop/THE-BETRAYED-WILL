@@ -63,7 +63,10 @@ list_suites() {
   echo "Additional suites:"
   for f in "$TEST_DIR"/*.mjs; do
     base="$(basename "$f")"
-    [ "$base" = "harness.mjs" ] && continue
+    # Any file ending in harness.mjs is imported by suites, never run as one.
+    # Matching only the exact name let a second shared helper be discovered as a
+    # suite that passes by declaring no tests - a green line measuring nothing.
+    case "$base" in *harness.mjs) continue ;; esac
     skip=0
     for s in "${REQUIRED_SUITES[@]}"; do [ "$base" = "$s" ] && skip=1; done
     [ "$skip" -eq 0 ] && echo "  $base"
@@ -98,7 +101,7 @@ if [ "$#" -eq 0 ]; then
   for s in "${REQUIRED_SUITES[@]}"; do TARGETS+=("$s"); done
   for f in "$TEST_DIR"/*.mjs; do
     base="$(basename "$f")"
-    [ "$base" = "harness.mjs" ] && continue
+    case "$base" in *harness.mjs) continue ;; esac
     skip=0
     for s in "${REQUIRED_SUITES[@]}"; do [ "$base" = "$s" ] && skip=1; done
     [ "$skip" -eq 0 ] && TARGETS+=("$base")
@@ -108,7 +111,7 @@ else
     matched=0
     for f in "$TEST_DIR"/*.mjs; do
       base="$(basename "$f")"
-      [ "$base" = "harness.mjs" ] && continue
+      case "$base" in *harness.mjs) continue ;; esac
       if [ "$base" = "$arg" ] || [ "$base" = "$arg.mjs" ] || [[ "$base" == *"$arg"* ]]; then
         TARGETS+=("$base")
         matched=1

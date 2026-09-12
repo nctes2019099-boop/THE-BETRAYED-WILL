@@ -44,6 +44,7 @@ import { ThirdPersonCamera } from './sim/camera.js';
 import { MissionManager, EventKind } from './sim/mission.js';
 import { DialogueWalker } from './sim/dialogue.js';
 import { Conversation, TREE_BY_LANDMARK, muteEvents } from './sim/conversation.js';
+import { CinematicDirector, PLAYER_CHARACTER, CINEMATIC_IDS } from './sim/cinematic.js';
 import { StoryState } from './sim/story-state.js';
 import { AISquad, AIState, makeGuard } from './sim/ai.js';
 import { SaveSystem } from './sim/save.js';
@@ -173,7 +174,20 @@ export class Game {
     this.camera3d.rotation.order = 'YXZ';
 
     this.state = new StoryState({ language: this.language });
-    this.missions = new MissionManager({ bus: this.bus, state: this.state, language: this.language });
+    // The director has to exist before the mission manager, which is what calls it:
+    // playCinematic() hands the sequence over and defers the objective notification
+    // until the player has watched. Without it, all nine cinematics fire, set their
+    // flags and complete their objectives in a single synchronous call - accounted
+    // for, and invisible.
+    this.cinematics = new CinematicDirector({
+      bus: this.bus,
+      language: this.language,
+      resolveSubject: (id) => this._resolveCinematicSubject(id),
+      heightAt: (x, z) => (this.space ? this.space.heightAt(x, z) : null),
+    });
+    this.missions = new MissionManager({
+      bus: this.bus, state: this.state, language: this.language, cinematics: this.cinematics,
+    });
     // The walker owns the dialogue graph; the Conversation owns its pacing and is
     // what tells the mission system a scene was actually sat through. Without both,
     // all fourteen trees are unreachable and every DIALOGUE objective is impossible.
@@ -221,6 +235,14 @@ export class Game {
     };
     this.bus.on(Events.NOISE_EMITTED, this._noiseSub);
 
+    this.bus.on(Events.CUTSCENE_START, (payload) => {
+      // A cinematic is authored for a place, and its shots resolve subjects against
+      // that place's geometry. Playing it from the wrong region would verify the
+      // camera against colliders that are not there and frame shots of a room the
+      // player is not standing in. `resumed` is a language refresh, not a new scene.
+      if (payload?.resumed) return;
+      if (payload?.region && payload.region !== this.regionId) this.travelTo(payload.region);
+    });
     this.bus.on(Events.PAUSE, () => { this.paused = true; });
     this.bus.on(Events.RESUME, () => { this.paused = false; });
 
@@ -381,7 +403,13 @@ export class Game {
     // is a ReferenceError on every frame, which is the kind of bug that never reaches
     // a browser when the loop is covered by a test.
     let steps = 0;
-    if (this.conversation?.active) {
+    if (this.cinematics?.active) {
+      // A cutscene stops the world for the same reason a conversation does, and it
+      // also has to drive the camera itself: the camera is normally updated from
+      // _fixedUpdate, and no fixed steps run while the world is frozen. Without this
+      // the shot would be sampled and then never drawn.
+      this._cinematicFrame(frameDt);
+    } else if (this.conversation?.active) {
       // A conversation stops the world. Guards keep patrolling through a scene and
       // the player is killed mid-sentence, which no amount of writing survives. The
       // scene clock still runs, because pacing is the one thing that must not freeze.
@@ -433,6 +461,56 @@ export class Game {
     if (!this.conversation.active) this._publishPrompt(null);
   }
 
+  /**
+   * Drive a running cinematic.
+   *
+   * Skippable from either the pause key or the interact key. A cinematic that cannot
+   * be skipped is a tax on replaying the game, and the flags and objectives it sets
+   * are applied by the mission layer either way, so nothing is lost by letting the
+   * player through early.
+   */
+  _cinematicFrame(dt) {
+    const intent = this.input.sample(dt);
+    if (this.input.takeAction('pause') || intent.interact) this.cinematics.skip();
+    this.cinematics.update(dt);
+    this._updateCinematicCamera(dt);
+    if (!this.cinematics.active) this._publishPrompt(null);
+  }
+
+  /**
+   * Feed the authored shot to the camera.
+   *
+   * ctx.cinematic is what ThirdPersonCamera._inferMode() keys on, and setting it
+   * routes the whole update through _updateCinematic - including the shot authored
+   * as mode:'FINISHER', which is framed with the finisher's own camera constants
+   * rather than by switching ctx mid-scene and snapping the player's view.
+   */
+  _updateCinematicCamera(dt) {
+    const payload = this.cinematics.cameraPayload();
+    if (!payload) return;
+    this.camera.update(dt, this.player, {
+      region: this.regionDef,
+      timeOfDay: this.regionDef?.timeOfDay ?? 'dusk',
+      weather: this.weather,
+      indoor: this.regionDef?.indoor === true,
+      reducedMotion: this.reducedMotion === true,
+      cinematic: payload,
+    });
+  }
+
+  /**
+   * A live position for a cinematic subject.
+   *
+   * Only the player has one: CHARACTERS is narrative data and the world spawns
+   * guards, not cast, so landmarks are resolved by the director from content and a
+   * named character with no body is anchored and counted there. This hook is where a
+   * cast-body system would plug in later without the director changing.
+   */
+  _resolveCinematicSubject(id) {
+    if (id !== PLAYER_CHARACTER) return null;
+    return this.player?.pos ? this.player.pos.clone() : null;
+  }
+
   _fixedUpdate(dt) {
     const intent = this.input.sample(dt);
     // PlayerController has no bow state to read, so the intent is the authority on
@@ -452,6 +530,11 @@ export class Game {
       hidden: this._inHidingSpot(),
       inCombat: this._inCombat(),
       interactable: this._nearestInteractable(),
+      reducedMotion: this.reducedMotion === true,
+      // Null while nothing is playing, which is what keeps the gameplay solver in
+      // charge. A cinematic normally runs through _cinematicFrame instead, but a
+      // caller driving _fixedUpdate directly still gets a correct camera.
+      cinematic: this.cinematics?.active ? this.cinematics.cameraPayload() : null,
     };
 
     this.player.update(dt, intent, ctx);
@@ -534,7 +617,7 @@ export class Game {
    * visible stutter caused entirely by the HUD.
    */
   _updateInteraction() {
-    if (this.conversation?.active) return;
+    if (this.conversation?.active || this.cinematics?.active) return;
     const p = this.player.pos;
     const target = this._nearestInteractable();
     const door = target ? null : this.space?.nearestDoor(p.x, p.z, DOOR_PROMPT_M);
@@ -746,6 +829,7 @@ export class Game {
     this.language = language === 'en' ? 'en' : 'ar';
     this.missions.setLanguage?.(this.language);
     this.conversation?.setLanguage(this.language);
+    this.cinematics?.setLanguage(this.language);
     this.state.language = this.language;
     this.bus.emit(Events.LANGUAGE_CHANGED, { language: this.language });
     this.prompt = null;   // force the prompt to be republished in the new language
@@ -798,6 +882,8 @@ export class Game {
       prompt: this.prompt,
       conversation: this.conversation?.describe() ?? null,
       dialogueTreesReachable: Object.keys(TREE_BY_LANDMARK).length,
+      cinematic: this.cinematics?.describe() ?? null,
+      cinematicsPlayable: CINEMATIC_IDS.length,
       perception: this.lastTruth ? {
         lightLevel: Number(this.lastTruth.lightLevel.toFixed(3)),
         inShadow: this.lastTruth.inShadow,

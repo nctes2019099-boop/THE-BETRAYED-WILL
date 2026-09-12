@@ -209,9 +209,17 @@ export function objectiveSoftLocks(mission, has = () => true, isDone = () => fal
 }
 
 export class MissionManager {
-  constructor({ bus = globalBus, state = new StoryState(), language } = {}) {
+  constructor({ bus = globalBus, state = new StoryState(), language, cinematics = null } = {}) {
     this.bus = bus;
     this.state = state;
+    /**
+     * An optional CinematicDirector. When one is supplied, playCinematic() hands the
+     * sequence over and defers CUTSCENE_END and the objective notification until the
+     * player has actually watched it. When it is absent - every headless suite - the
+     * immediate path below is unchanged, so this injection cannot regress a test that
+     * never asked for a picture.
+     */
+    this.cinematics = cinematics;
     /** The language this manager was asked for, kept so a load cannot override it. */
     this.language = language ? (language === 'en' ? 'en' : 'ar') : null;
     if (this.language) this.state.language = this.language;
@@ -536,10 +544,27 @@ export class MissionManager {
     const cin = CINEMATIC_MAP[cinematicId];
     if (!cin) { this.problems.push({ kind: 'unknown-cinematic', cinematicId }); return false; }
     const first = this.state.seeCinematic(cinematicId);
-    this.bus.emit(Events.CUTSCENE_START, { cinematicId, seconds: cin.seconds, region: cin.region });
-    this.bus.emit(Events.CUTSCENE_END, { cinematicId, seconds: cin.seconds });
+    // Story consequences are applied whether or not anything is drawn: the injury and
+    // the flags are what later systems read, and withholding them behind a cutscene
+    // the player skipped would change the simulation on the strength of presentation.
     if (cin.setsInjured) this.setFlag('wounded');
     for (const f of cin.setsFlags ?? []) this.setFlag(f);
+
+    if (this.cinematics?.play) {
+      const res = this.cinematics.play(cinematicId, {
+        onEnd: () => {
+          if (first) this.notify({ kind: EventKind.CINEMATIC, id: cinematicId });
+        },
+      });
+      // A refusal - a second cinematic asked for while one is running - falls through
+      // to the immediate path rather than dropping the objective on the floor. A
+      // cutscene that cannot be shown must still not be a cutscene that blocks story.
+      if (res?.ok) return true;
+      this.problems.push({ kind: 'cinematic-refused', cinematicId, reason: res?.reason ?? 'refused' });
+    }
+
+    this.bus.emit(Events.CUTSCENE_START, { cinematicId, seconds: cin.seconds, region: cin.region });
+    this.bus.emit(Events.CUTSCENE_END, { cinematicId, seconds: cin.seconds });
     if (first) this.notify({ kind: EventKind.CINEMATIC, id: cinematicId });
     return true;
   }

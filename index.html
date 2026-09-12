@@ -181,6 +181,44 @@ canvas#view {
 /* "Interact" is meaningless mid-sentence, so the prompt stands down for the scene. */
 body.in-dialogue #prompt { display: none; }
 
+/* Cutscenes. Letterbox bars and a title card.
+   z-index 24 sits above #touch (22) and below #dialogue (26): a film covers the
+   controls, because none of them do anything while the world is frozen, and the
+   touch layer is hidden outright rather than left drawing buttons under a bar.
+   Below #pause (30) so a menu can still be summoned over it if it must be. */
+#cutscene { position: fixed; inset: 0; z-index: 24; display: none; pointer-events: none; }
+#cutscene.on { display: block; }
+#cutscene .bar { position: absolute; inset-inline: 0; height: 6.5vh; background: #000; }
+#cutscene .bar.top { inset-block-start: 0; }
+#cutscene .bar.bottom { inset-block-end: 0; }
+#cutCard {
+  position: absolute; inset-block-end: calc(6.5vh + 26px); inset-inline: 0;
+  margin-inline: auto; width: min(700px, 90vw); padding: 15px 20px 16px;
+  text-align: center; animation: cardIn 0.5s ease both;
+}
+#cutCard.noanim { animation: none; }
+@keyframes cardIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+#cutCard .title {
+  font-family: var(--font-display); color: var(--gold);
+  font-size: clamp(17px, 3vw, 23px); letter-spacing: 0.6px; margin-block-end: 7px;
+}
+#cutCard .text { font-size: clamp(13px, 2.3vw, 16px); line-height: 1.7; color: var(--ink); }
+#cutCard .foot {
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  margin-block-start: 13px;
+}
+#cutCard .hint { font-size: 11px; color: var(--ink-dim); }
+#cutSkip {
+  pointer-events: auto; cursor: pointer; padding: 7px 15px;
+  background: none; border: 1px solid var(--panel-line); border-radius: 7px;
+  color: var(--ink-dim); font-family: var(--font); font-size: 12px;
+}
+#cutSkip:hover { color: var(--ink); border-color: var(--gold); }
+/* A film owns the screen: no prompt, no touch controls, no dialogue panel under it. */
+body.in-cutscene #prompt { display: none; }
+body.in-cutscene #touch { display: none; }
+body.in-cutscene #dialogue { display: none; }
+
 /* Toasts, centre. */
 #toasts {
   position: absolute; inset-block-start: 22%; inset-inline: 0;
@@ -330,6 +368,20 @@ body.in-dialogue #prompt { display: none; }
   <div id="telemetry" class="panel"></div>
 </div>
 
+<!-- Cutscene: letterbox bars and the title card for the nine authored cinematics. -->
+<div id="cutscene">
+  <div class="bar top"></div>
+  <div class="bar bottom"></div>
+  <div id="cutCard" class="panel">
+    <div class="title"></div>
+    <div class="text"></div>
+    <div class="foot">
+      <span class="hint" id="cutHint"></span>
+      <button type="button" id="cutSkip" data-i18n="cin-skipbtn">تخطّي المشهد</button>
+    </div>
+  </div>
+</div>
+
 <!-- Dialogue: the speaker, the line being read, and the choices when they go live. -->
 <div id="dialogue" class="panel">
   <div class="who"></div>
@@ -432,6 +484,8 @@ const el = {
   detection: $('detection'), detLabel: document.querySelector('#detection .label'), detEye: document.querySelector('#detection .eye'),
   prompt: $('prompt'), promptKey: document.querySelector('#prompt kbd'), promptLabel: document.querySelector('#prompt .label'),
   subtitle: $('subtitle'), subWho: document.querySelector('#subtitle .who'), subLine: document.querySelector('#subtitle .line'),
+  cutscene: $('cutscene'), cutCard: $('cutCard'), cutTitle: document.querySelector('#cutCard .title'),
+  cutText: document.querySelector('#cutCard .text'), cutHint: $('cutHint'), cutSkip: $('cutSkip'),
   dialogue: $('dialogue'), dlgWho: document.querySelector('#dialogue .who'),
   dlgLine: document.querySelector('#dialogue .line'), dlgList: document.querySelector('#dialogue .list'),
   dlgHint: document.querySelector('#dialogue .hint'), dlgLeave: $('dlgLeave'),
@@ -462,6 +516,7 @@ const STRINGS = {
     'dlg-leave': 'اترك الحديث', 'dlg-pick': 'اختر ردّاً',
     'dlg-cont': 'اضغط E للمتابعة', 'dlg-cont-touch': 'اضغط للمتابعة',
     'dlg-locked': 'مغلق', 'dlg-needs': 'يحتاج دليلًا لم تُحصّله بعد',
+    'cin-skipbtn': 'تخطّي المشهد', 'cin-skip': 'E أو Esc للتخطي',
   },
   en: {
     'boot-start': 'Preparing…', 'boot-world': 'Building the world…', 'boot-ready': 'Ready',
@@ -482,6 +537,7 @@ const STRINGS = {
     'dlg-leave': 'Leave', 'dlg-pick': 'Choose a reply',
     'dlg-cont': 'Press E to continue', 'dlg-cont-touch': 'Tap to continue',
     'dlg-locked': 'Locked', 'dlg-needs': 'Needs evidence you have not found',
+    'cin-skipbtn': 'Skip scene', 'cin-skip': 'E or Esc to skip',
   },
 };
 
@@ -660,6 +716,32 @@ globalBus.on(Events.SUBTITLE, (p) => {
   clearTimeout(el.subtitle._t);
   el.subtitle._t = setTimeout(() => el.subtitle.classList.remove('on'), (p.ms ?? 3200));
 });
+
+/* ------------------------------------------------------------------ cutscenes
+ * Two events, and this file only draws. The CinematicDirector owns the clock and
+ * the shot list; MissionManager defers the objective notification until the scene
+ * has actually run. Before that wiring, both events fired in the same synchronous
+ * call, so the nine cinematics were accounted for and invisible.
+ */
+function cutClose() {
+  el.cutscene.classList.remove('on');
+  document.body.classList.remove('in-cutscene');
+}
+
+globalBus.on(Events.CUTSCENE_START, (p) => {
+  el.cutscene.classList.add('on');
+  document.body.classList.add('in-cutscene');
+  el.cutTitle.textContent = p?.title ?? '';
+  el.cutText.textContent = p?.text ?? '';
+  el.cutHint.textContent = isTouch ? '' : t('cin-skip');
+  // `resumed` is a language refresh, not a new scene, so the card must not replay its
+  // entrance animation and look like the cutscene restarted.
+  el.cutCard.classList.toggle('noanim', p?.resumed === true);
+});
+
+globalBus.on(Events.CUTSCENE_END, () => cutClose());
+
+el.cutSkip.addEventListener('click', () => game?.cinematics?.skip());
 
 globalBus.on(Events.DIALOGUE_END, () => {
   el.subtitle.classList.remove('on');
@@ -954,8 +1036,9 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'Escape') {
     if (el.boot.style.display !== 'none') return;
     // Mid-scene, Escape walks away and the game loop handles it. Opening the pause
-    // menu over a conversation would leave two things claiming the same key.
-    if (game?.conversation?.active) return;
+    // menu over a conversation would leave two things claiming the same key. The
+    // same is true of a cutscene, where Escape skips.
+    if (game?.conversation?.active || game?.cinematics?.active) return;
     togglePause();
     e.preventDefault();
   }
