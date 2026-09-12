@@ -1,0 +1,22 @@
+{
+  "name": "the-betrayed-will",
+  "version": "1.0.0",
+  "description": "وصية الغدر — The Betrayed Will. Third-person narrative action/stealth/investigation game set in an ancient Mesopotamian world. Offline, WebGL, zero runtime dependencies.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "bash run.sh verify.mjs",
+    "lint": "bash lint.sh",
+    "serve": "node tools/serve.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nctes2019099-boop/THE-BETRAYED-WILL.git"
+  }
+}

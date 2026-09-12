@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0d1220">
+<meta name="description" content="وصية الغدر — لعبة تحقيق وتسلل وحركة في بلاد الرافدين">
+<title>وصية الغدر — The Betrayed Will</title>
+<style>
+/*
+  No external assets: no webfonts, no CDN, no images. Everything here is CSS and
+  text, and every glyph the player sees is either a system font or drawn on a
+  canvas by the renderer. The brief forbids downloaded assets and this is what
+  complying with that looks like at the UI layer.
+
+  Arabic is the first-class language, so the document is dir="rtl" and positioned
+  with logical properties (inset-inline-start, margin-inline-end). Mirroring a
+  left-to-right layout with transform: scaleX(-1) is the usual shortcut and it
+  breaks text, so it is not used anywhere here.
+*/
+:root {
+  --ink: #e8dcc4;
+  --ink-dim: #a99b80;
+  --lapis: #27408b;
+  --gold: #c9a227;
+  --bronze: #9c7a3c;
+  --blood: #8e2b20;
+  --night: #0d1220;
+  --panel: rgba(14, 17, 26, 0.88);
+  --panel-line: rgba(201, 162, 39, 0.28);
+  --shadow: 0 2px 18px rgba(0,0,0,0.6);
+  --font: "Segoe UI", "Noto Sans Arabic", "Noto Kufi Arabic", "Tahoma", "Arial", system-ui, sans-serif;
+  --font-display: "Noto Kufi Arabic", "Segoe UI", "Tahoma", system-ui, sans-serif;
+  --safe-t: env(safe-area-inset-top, 0px);
+  --safe-b: env(safe-area-inset-bottom, 0px);
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body {
+  margin: 0; padding: 0; height: 100%; overflow: hidden;
+  background: var(--night); color: var(--ink);
+  font-family: var(--font);
+  overscroll-behavior: none;
+  touch-action: none;
+}
+#stage { position: fixed; inset: 0; }
+canvas#view {
+  display: block; width: 100%; height: 100%;
+  touch-action: none;
+}
+
+/* ------------------------------------------------------------ boot screen */
+#boot {
+  position: fixed; inset: 0; z-index: 40;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 18px; background: radial-gradient(ellipse at 50% 40%, #1b2333 0%, #080b12 70%);
+  transition: opacity 0.6s ease; padding: 24px; text-align: center;
+}
+#boot.hidden { opacity: 0; pointer-events: none; }
+#boot h1 {
+  font-family: var(--font-display); font-size: clamp(28px, 6vw, 54px);
+  margin: 0; letter-spacing: 0.5px; color: var(--gold);
+  text-shadow: 0 2px 24px rgba(201,162,39,0.35);
+}
+#boot .sub { color: var(--ink-dim); font-size: clamp(13px, 2.4vw, 17px); margin: 0; }
+#bootbar {
+  width: min(420px, 78vw); height: 4px; background: rgba(255,255,255,0.09);
+  border-radius: 2px; overflow: hidden;
+}
+#bootbar i { display: block; height: 100%; width: 0%; background: var(--gold); transition: width 0.25s ease; }
+#bootstatus { font-size: 13px; color: var(--ink-dim); min-height: 1.4em; }
+#boot .btn { margin-top: 10px; }
+
+/* ------------------------------------------------------------------- HUD */
+#hud { position: fixed; inset: 0; z-index: 20; pointer-events: none; }
+#hud > * { pointer-events: none; }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--panel-line);
+  border-radius: 10px; box-shadow: var(--shadow); backdrop-filter: blur(6px);
+}
+
+/* Objective, top inline-start (right in RTL, left in LTR). */
+#objective {
+  position: absolute; inset-block-start: calc(14px + var(--safe-t)); inset-inline-start: 14px;
+  max-width: min(360px, 44vw); padding: 10px 14px;
+}
+#objective .chapter { font-size: 11px; letter-spacing: 1.6px; color: var(--bronze); text-transform: uppercase; }
+#objective .text { font-size: 15px; line-height: 1.5; margin-block-start: 3px; }
+#objective .count { font-size: 11px; color: var(--ink-dim); margin-block-start: 4px; }
+
+/* Vitals, bottom inline-start. */
+#vitals {
+  position: absolute; inset-block-end: calc(16px + var(--safe-b)); inset-inline-start: 14px;
+  width: min(240px, 40vw); padding: 10px 12px; display: grid; gap: 7px;
+}
+.bar { display: grid; grid-template-columns: 1fr; gap: 3px; }
+.bar label { font-size: 10px; letter-spacing: 1.2px; color: var(--ink-dim); }
+.bar .track { height: 7px; background: rgba(255,255,255,0.09); border-radius: 4px; overflow: hidden; }
+.bar .fill { height: 100%; width: 100%; border-radius: 4px; transition: width 0.14s linear; }
+.bar.health .fill { background: linear-gradient(90deg, #8e2b20, #d1622a); }
+.bar.stamina .fill { background: linear-gradient(90deg, #3f6b52, #9dc98a); }
+.bar.low .fill { animation: pulse 1.1s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.42; } }
+
+/* Detection, top inline-end. */
+#detection {
+  position: absolute; inset-block-start: calc(14px + var(--safe-t)); inset-inline-end: 14px;
+  padding: 8px 12px; font-size: 12px; letter-spacing: 1px; display: none;
+}
+#detection.on { display: block; }
+#detection .eye { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-inline-end: 7px; vertical-align: middle; }
+
+/* Interaction prompt, bottom centre. */
+#prompt {
+  position: absolute; inset-block-end: calc(90px + var(--safe-b)); inset-inline: 0;
+  margin-inline: auto; width: max-content; max-width: 88vw;
+  padding: 9px 18px; font-size: 15px; display: none; text-align: center;
+}
+#prompt.on { display: block; }
+#prompt kbd {
+  display: inline-block; min-width: 24px; padding: 2px 7px; margin-inline-end: 9px;
+  border: 1px solid var(--panel-line); border-radius: 5px;
+  background: rgba(201,162,39,0.12); color: var(--gold);
+  font-family: var(--font); font-size: 12px; font-weight: 700;
+}
+
+/* Subtitles, above the prompt. */
+#subtitle {
+  position: absolute; inset-block-end: calc(150px + var(--safe-b)); inset-inline: 0;
+  margin-inline: auto; width: min(760px, 90vw); padding: 12px 18px;
+  font-size: clamp(15px, 2.6vw, 19px); line-height: 1.65; text-align: center; display: none;
+}
+#subtitle.on { display: block; }
+#subtitle .who { color: var(--gold); font-size: 12px; letter-spacing: 1.4px; margin-block-end: 4px; }
+
+/* Dialogue. A scene is read at a speed and answered with a choice, so it gets a
+   panel of its own rather than borrowing the subtitle strip: the subtitle has
+   nowhere to put four buttons, and the buttons are the part the player owns.
+   z-index 26 is deliberate - it sits above #touch (22), because a scene freezes
+   the world, so the movement stick has nothing to do and the buttons must win the
+   tap. Below #pause (30) and #boot (40), which should always be able to cover it. */
+#dialogue {
+  position: fixed; inset-block-end: calc(150px + var(--safe-b)); inset-inline: 0;
+  margin-inline: auto; width: min(760px, 92vw); z-index: 26;
+  padding: 13px 18px 15px; display: none; pointer-events: none;
+}
+#dialogue.on { display: block; }
+#dialogue .who { color: var(--gold); font-size: 12px; letter-spacing: 1.4px; margin-block-end: 5px; }
+#dialogue .line { font-size: clamp(15px, 2.6vw, 19px); line-height: 1.65; min-height: 1.6em; }
+#dialogue .list {
+  display: flex; flex-direction: column; gap: 8px;
+  margin-block-start: 12px; max-height: 34vh; overflow-y: auto;
+}
+#dialogue .list:empty { display: none; }
+#dialogue .list button {
+  pointer-events: auto; cursor: pointer; width: 100%; padding: 9px 12px;
+  display: flex; align-items: baseline; gap: 10px; text-align: start;
+  background: rgba(201,162,39,0.07); border: 1px solid var(--panel-line); border-radius: 8px;
+  color: var(--ink); font-family: var(--font); font-size: clamp(14px, 2.2vw, 16px); line-height: 1.5;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+#dialogue .list button:hover:not([disabled]),
+#dialogue .list button:focus-visible { background: rgba(201,162,39,0.18); border-color: var(--gold); outline: none; }
+#dialogue .list button[disabled] { cursor: not-allowed; opacity: 0.55; }
+#dialogue .list kbd {
+  flex: none; min-width: 22px; padding: 1px 6px; text-align: center;
+  border: 1px solid var(--panel-line); border-radius: 5px;
+  background: rgba(201,162,39,0.12); color: var(--gold);
+  font-family: var(--font); font-size: 12px; font-weight: 700;
+}
+#dialogue .list i { margin-inline-start: auto; font-style: normal; font-size: 11px; color: var(--ink-dim); }
+#dialogue .foot { display: flex; align-items: center; gap: 12px; margin-block-start: 12px; }
+#dialogue .list:empty + .foot { margin-block-start: 13px; }
+#dialogue .hint { font-size: 12px; color: var(--ink-dim); }
+#dialogue .leave {
+  pointer-events: auto; cursor: pointer; margin-inline-start: auto; padding: 6px 12px;
+  background: none; border: 1px solid var(--panel-line); border-radius: 7px;
+  color: var(--ink-dim); font-family: var(--font); font-size: 12px;
+}
+#dialogue .leave:hover { color: var(--ink); border-color: var(--gold); }
+/* "Interact" is meaningless mid-sentence, so the prompt stands down for the scene. */
+body.in-dialogue #prompt { display: none; }
+
+/* Toasts, centre. */
+#toasts {
+  position: absolute; inset-block-start: 22%; inset-inline: 0;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.toast {
+  padding: 9px 20px; font-size: 14px; animation: rise 0.3s ease;
+  border-inline-start: 3px solid var(--gold);
+}
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* Telemetry, bottom inline-end. Off unless asked for. */
+#telemetry {
+  position: absolute; inset-block-end: calc(16px + var(--safe-b)); inset-inline-end: 14px;
+  padding: 8px 11px; font-size: 11px; line-height: 1.65; display: none;
+  font-variant-numeric: tabular-nums; direction: ltr; text-align: left;
+}
+#telemetry.on { display: block; }
+#telemetry b { color: var(--gold); font-weight: 600; }
+#telemetry .warn { color: #d1622a; }
+
+/* --------------------------------------------------------------- menus */
+.menu {
+  position: fixed; inset: 0; z-index: 30; display: none;
+  align-items: center; justify-content: center;
+  background: rgba(6, 8, 14, 0.78); backdrop-filter: blur(4px); padding: 20px;
+}
+.menu.on { display: flex; }
+.sheet {
+  width: min(520px, 94vw); max-height: 88vh; overflow-y: auto;
+  padding: 22px 24px; display: grid; gap: 14px;
+}
+.sheet h2 {
+  font-family: var(--font-display); margin: 0; font-size: 21px; color: var(--gold);
+  letter-spacing: 0.4px;
+}
+.sheet h3 { margin: 6px 0 0; font-size: 12px; letter-spacing: 1.5px; color: var(--bronze); text-transform: uppercase; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn {
+  pointer-events: auto; cursor: pointer;
+  padding: 10px 18px; font-size: 14px; font-family: var(--font);
+  color: var(--ink); background: rgba(255,255,255,0.05);
+  border: 1px solid var(--panel-line); border-radius: 8px;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.btn:hover, .btn:focus-visible { background: rgba(201,162,39,0.16); border-color: var(--gold); outline: none; }
+.btn:active { transform: translateY(1px); }
+.btn[aria-pressed="true"] { background: rgba(201,162,39,0.24); border-color: var(--gold); color: #fff; }
+.btn.primary { background: rgba(201,162,39,0.2); border-color: var(--gold); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.slots { display: grid; gap: 7px; }
+.slot {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 12px; border: 1px solid rgba(255,255,255,0.09); border-radius: 8px;
+  background: rgba(255,255,255,0.03); font-size: 13px;
+}
+.slot .meta { color: var(--ink-dim); font-size: 11px; direction: ltr; text-align: end; }
+.slot .acts { display: flex; gap: 6px; }
+.slot .acts .btn { padding: 5px 11px; font-size: 12px; }
+.note { font-size: 12px; color: var(--ink-dim); line-height: 1.6; }
+.note.warn { color: #d19a5a; }
+
+/* ------------------------------------------------------- touch controls */
+#touch { position: fixed; inset: 0; z-index: 22; display: none; pointer-events: none; }
+#touch.on { display: block; }
+#stickZone {
+  position: absolute; inset-block-end: 0; inset-inline-start: 0;
+  width: 44vw; height: 46vh; pointer-events: auto;
+}
+#stick {
+  position: absolute; width: 116px; height: 116px; border-radius: 50%;
+  border: 2px solid rgba(201,162,39,0.35); background: rgba(14,17,26,0.34);
+  display: none; pointer-events: none;
+}
+#stick i {
+  position: absolute; inset: 0; margin: auto; width: 48px; height: 48px; border-radius: 50%;
+  background: rgba(201,162,39,0.5); border: 1px solid rgba(255,255,255,0.25);
+}
+#lookZone {
+  position: absolute; inset-block-end: 0; inset-inline-end: 0;
+  width: 56vw; height: 74vh; pointer-events: auto;
+}
+#touchButtons {
+  position: absolute; inset-block-end: calc(18px + var(--safe-b)); inset-inline-end: 14px;
+  display: grid; grid-template-columns: repeat(2, 62px); gap: 10px; pointer-events: auto;
+}
+.tbtn {
+  width: 62px; height: 62px; border-radius: 50%;
+  border: 1px solid var(--panel-line); background: rgba(14,17,26,0.55);
+  color: var(--ink); font-size: 11px; font-family: var(--font);
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  line-height: 1.2; padding: 4px; user-select: none;
+}
+.tbtn.hit { background: rgba(201,162,39,0.35); }
+#touchTop {
+  position: absolute; inset-block-start: calc(12px + var(--safe-t)); inset-inline-end: 12px;
+  display: flex; gap: 8px; pointer-events: auto;
+}
+#touchTop .tbtn { width: 44px; height: 44px; font-size: 15px; }
+
+/* Small screens: the HUD gives up space to the controls. */
+@media (max-width: 720px) {
+  #objective { max-width: 56vw; padding: 8px 11px; }
+  #objective .text { font-size: 13px; }
+  #vitals { width: 42vw; }
+  #telemetry { display: none !important; }
+}
+
+/* Reduced motion: the brief's accessibility requirement, honoured in CSS too. */
+@media (prefers-reduced-motion: reduce) {
+  .bar.low .fill { animation: none; }
+  .toast { animation: none; }
+  #boot { transition: none; }
+}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="view"></canvas>
+</div>
+
+<!-- HUD -->
+<div id="hud">
+  <div id="objective" class="panel">
+    <div class="chapter" data-i18n="prologue">المقدمة</div>
+    <div class="text" data-i18n="objective-none">لا يوجد هدف حالي</div>
+    <div class="count"></div>
+  </div>
+
+  <div id="detection" class="panel"><span class="eye"></span><span class="label"></span></div>
+
+  <div id="vitals" class="panel">
+    <div class="bar health">
+      <label data-i18n="health">الصحة</label>
+      <div class="track"><div class="fill"></div></div>
+    </div>
+    <div class="bar stamina">
+      <label data-i18n="stamina">اللياقة</label>
+      <div class="track"><div class="fill"></div></div>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+  <div id="subtitle" class="panel"><div class="who"></div><div class="line"></div></div>
+  <div id="prompt" class="panel"><kbd></kbd><span class="label"></span></div>
+  <div id="telemetry" class="panel"></div>
+</div>
+
+<!-- Dialogue: the speaker, the line being read, and the choices when they go live. -->
+<div id="dialogue" class="panel">
+  <div class="who"></div>
+  <div class="line"></div>
+  <div class="list"></div>
+  <div class="foot">
+    <span class="hint"></span>
+    <button type="button" class="leave" id="dlgLeave" data-i18n="dlg-leave">اترك الحديث</button>
+  </div>
+</div>
+
+<!-- Touch controls -->
+<div id="touch">
+  <div id="stickZone"><div id="stick"><i></i></div></div>
+  <div id="lookZone"></div>
+  <div id="touchTop">
+    <div class="tbtn" data-act="pause">II</div>
+    <div class="tbtn" data-act="crouch" data-i18n-short="crouch">انحناء</div>
+  </div>
+  <div id="touchButtons">
+    <div class="tbtn" data-act="attackLight" data-i18n-short="attack">ضرب</div>
+    <div class="tbtn" data-act="block" data-i18n-short="block">صد</div>
+    <div class="tbtn" data-act="jump" data-i18n-short="jump">قفز</div>
+    <div class="tbtn" data-act="interact" data-i18n-short="interact">تفاعل</div>
+    <div class="tbtn" data-act="sprint" data-i18n-short="sprint">ركض</div>
+    <div class="tbtn" data-act="dodge" data-i18n-short="dodge">مراوغة</div>
+  </div>
+</div>
+
+<!-- Pause menu -->
+<div id="pause" class="menu">
+  <div class="sheet panel">
+    <h2 data-i18n="paused">توقفت اللعبة</h2>
+
+    <h3 data-i18n="slots">مواضع الحفظ</h3>
+    <div id="slots" class="slots"></div>
+    <div id="storageNote" class="note"></div>
+
+    <h3 data-i18n="language">اللغة</h3>
+    <div class="row">
+      <button class="btn" id="lang-ar" aria-pressed="true">العربية</button>
+      <button class="btn" id="lang-en" aria-pressed="false">English</button>
+    </div>
+
+    <h3 data-i18n="quality">جودة الرسم</h3>
+    <div class="row" id="qualityRow">
+      <button class="btn" data-q="low" data-i18n="q-low">منخفضة</button>
+      <button class="btn" data-q="medium" aria-pressed="true" data-i18n="q-med">متوسطة</button>
+      <button class="btn" data-q="high" data-i18n="q-high">عالية</button>
+    </div>
+
+    <h3 data-i18n="weather">الطقس</h3>
+    <div class="row" id="weatherRow">
+      <button class="btn" data-w="clear" aria-pressed="true" data-i18n="w-clear">صحو</button>
+      <button class="btn" data-w="overcast" data-i18n="w-overcast">غائم</button>
+      <button class="btn" data-w="dust" data-i18n="w-dust">غبار</button>
+      <button class="btn" data-w="rain" data-i18n="w-rain">مطر</button>
+      <button class="btn" data-w="storm" data-i18n="w-storm">عاصفة</button>
+    </div>
+
+    <div class="row">
+      <button class="btn primary" id="resume" data-i18n="resume">متابعة</button>
+      <button class="btn" id="toggleTelemetry" data-i18n="telemetry">أرقام الأداء</button>
+      <button class="btn" id="diag" data-i18n="diagnostics">التشخيص</button>
+    </div>
+    <div id="diagOut" class="note" style="direction:ltr;text-align:left;white-space:pre-wrap"></div>
+  </div>
+</div>
+
+<!-- Boot -->
+<div id="boot">
+  <h1>وصية الغدر</h1>
+  <p class="sub">The Betrayed Will — بلاد الرافدين</p>
+  <div id="bootbar"><i></i></div>
+  <div id="bootstatus" data-i18n="boot-start">جارٍ التهيئة…</div>
+  <button class="btn primary" id="begin" style="display:none" data-i18n="begin">ابدأ</button>
+</div>
+
+<script type="module">
+/**
+ * The page's wiring.
+ *
+ * This file owns the DOM and nothing else. Every game decision lives in src/, and
+ * the boundary between them is the event bus: the simulation emits, the HUD listens.
+ * Nothing here reads a character's position to draw a health bar, because a HUD that
+ * reaches into the simulation is a second source of truth that will eventually
+ * disagree with the first.
+ */
+import { globalBus, Events } from './src/core/bus.js';
+import { bootGame } from './src/main.js';
+import { SAVE } from './src/core/constants.js';
+import { hasPersistentStorage } from './src/platform/browser.js';
+
+const $ = (id) => document.getElementById(id);
+const el = {
+  boot: $('boot'), bootbar: $('bootbar').firstElementChild, bootstatus: $('bootstatus'), begin: $('begin'),
+  objective: $('objective'), chapter: document.querySelector('#objective .chapter'),
+  objText: document.querySelector('#objective .text'), objCount: document.querySelector('#objective .count'),
+  vitals: $('vitals'), health: document.querySelector('.bar.health'), stamina: document.querySelector('.bar.stamina'),
+  detection: $('detection'), detLabel: document.querySelector('#detection .label'), detEye: document.querySelector('#detection .eye'),
+  prompt: $('prompt'), promptKey: document.querySelector('#prompt kbd'), promptLabel: document.querySelector('#prompt .label'),
+  subtitle: $('subtitle'), subWho: document.querySelector('#subtitle .who'), subLine: document.querySelector('#subtitle .line'),
+  dialogue: $('dialogue'), dlgWho: document.querySelector('#dialogue .who'),
+  dlgLine: document.querySelector('#dialogue .line'), dlgList: document.querySelector('#dialogue .list'),
+  dlgHint: document.querySelector('#dialogue .hint'), dlgLeave: $('dlgLeave'),
+  toasts: $('toasts'), telemetry: $('telemetry'),
+  pause: $('pause'), slots: $('slots'), storageNote: $('storageNote'), diagOut: $('diagOut'),
+  touch: $('touch'), stick: $('stick'), stickKnob: document.querySelector('#stick i'),
+  stickZone: $('stickZone'), lookZone: $('lookZone'),
+};
+
+/* ---------------------------------------------------------------- i18n */
+const STRINGS = {
+  ar: {
+    'boot-start': 'جارٍ التهيئة…', 'boot-world': 'يُبنى العالم…', 'boot-ready': 'جاهز',
+    begin: 'ابدأ', paused: 'توقفت اللعبة', slots: 'مواضع الحفظ', language: 'اللغة',
+    quality: 'جودة الرسم', weather: 'الطقس', resume: 'متابعة', telemetry: 'أرقام الأداء',
+    diagnostics: 'التشخيص', health: 'الصحة', stamina: 'اللياقة',
+    'q-low': 'منخفضة', 'q-med': 'متوسطة', 'q-high': 'عالية',
+    'w-clear': 'صحو', 'w-overcast': 'غائم', 'w-dust': 'غبار', 'w-rain': 'مطر', 'w-storm': 'عاصفة',
+    'objective-none': 'لا يوجد هدف حالي', prologue: 'المقدمة',
+    save: 'حفظ', load: 'تحميل', empty: 'فارغ', autosave: 'حفظ تلقائي', quicksave: 'حفظ سريع',
+    'slot-n': 'موضع', 'no-storage': 'التخزين غير متاح في هذا المتصفح: لن يبقى التقدّم بعد إغلاق الصفحة.',
+    'saved': 'تم الحفظ', 'loaded': 'تم التحميل', 'save-failed': 'تعذّر الحفظ',
+    'pruned': 'أُفرغت مواضع حفظ قديمة لضيق المساحة',
+    calm: 'هادئ', suspicious: 'مرتاب', alerted: 'متنبّه', combat: 'قتال',
+    'ctx-lost': 'توقّف الرسم مؤقتاً…', 'ctx-restored': 'عاد الرسم',
+    crouch: 'انحناء', attack: 'ضرب', block: 'صد', jump: 'قفز', interact: 'تفاعل', sprint: 'ركض', dodge: 'مراوغة',
+    'playtime': 'زمن اللعب',
+    'dlg-leave': 'اترك الحديث', 'dlg-pick': 'اختر ردّاً',
+    'dlg-cont': 'اضغط E للمتابعة', 'dlg-cont-touch': 'اضغط للمتابعة',
+    'dlg-locked': 'مغلق', 'dlg-needs': 'يحتاج دليلًا لم تُحصّله بعد',
+  },
+  en: {
+    'boot-start': 'Preparing…', 'boot-world': 'Building the world…', 'boot-ready': 'Ready',
+    begin: 'Begin', paused: 'Paused', slots: 'Save slots', language: 'Language',
+    quality: 'Render quality', weather: 'Weather', resume: 'Resume', telemetry: 'Performance',
+    diagnostics: 'Diagnostics', health: 'Health', stamina: 'Stamina',
+    'q-low': 'Low', 'q-med': 'Medium', 'q-high': 'High',
+    'w-clear': 'Clear', 'w-overcast': 'Overcast', 'w-dust': 'Dust', 'w-rain': 'Rain', 'w-storm': 'Storm',
+    'objective-none': 'No active objective', prologue: 'Prologue',
+    save: 'Save', load: 'Load', empty: 'Empty', autosave: 'Autosave', quicksave: 'Quicksave',
+    'slot-n': 'Slot', 'no-storage': 'Storage is unavailable in this browser: progress will not survive closing the page.',
+    'saved': 'Saved', 'loaded': 'Loaded', 'save-failed': 'Save failed',
+    'pruned': 'Older saves were cleared to make room',
+    calm: 'Calm', suspicious: 'Suspicious', alerted: 'Alerted', combat: 'Combat',
+    'ctx-lost': 'Rendering paused…', 'ctx-restored': 'Rendering restored',
+    crouch: 'Crouch', attack: 'Attack', block: 'Block', jump: 'Jump', interact: 'Interact', sprint: 'Sprint', dodge: 'Dodge',
+    'playtime': 'Playtime',
+    'dlg-leave': 'Leave', 'dlg-pick': 'Choose a reply',
+    'dlg-cont': 'Press E to continue', 'dlg-cont-touch': 'Tap to continue',
+    'dlg-locked': 'Locked', 'dlg-needs': 'Needs evidence you have not found',
+  },
+};
+
+let lang = 'ar';
+const t = (key) => STRINGS[lang][key] ?? STRINGS.ar[key] ?? key;
+
+function applyLanguage(next) {
+  lang = next === 'en' ? 'en' : 'ar';
+  document.documentElement.lang = lang;
+  // Direction follows the language. Every position in the CSS uses logical
+  // properties, so this one attribute mirrors the whole interface correctly.
+  document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
+  for (const node of document.querySelectorAll('[data-i18n]')) {
+    node.textContent = t(node.dataset.i18n);
+  }
+  for (const node of document.querySelectorAll('[data-i18n-short]')) {
+    node.textContent = t(node.dataset.i18nShort);
+  }
+  $('lang-ar').setAttribute('aria-pressed', String(lang === 'ar'));
+  $('lang-en').setAttribute('aria-pressed', String(lang === 'en'));
+  renderSlots();
+  // A scene left open across a language switch has already had its current line
+  // re-published by the driver. The choice labels and the hint are drawn by this
+  // file rather than emitted, so redraw them from the same view or the player is
+  // left choosing between replies in a language they just switched away from.
+  if (el.dialogue?.classList.contains('on') && game?.conversation?.active) {
+    const v = game.conversation.view();
+    if (v) {
+      globalBus.emit(Events.DIALOGUE_CHOICES, {
+        treeId: v.treeId, nodeId: v.nodeId, speaker: v.speaker,
+        choices: v.choices ?? [], canAdvance: v.canAdvance === true, atEnd: v.atEnd === true,
+      });
+    }
+  }
+}
+
+/* --------------------------------------------------------------- toasts */
+function toast(text, kind = 'info') {
+  const node = document.createElement('div');
+  node.className = 'toast panel';
+  node.textContent = text;
+  if (kind === 'warn') node.style.borderInlineStartColor = '#d1622a';
+  el.toasts.appendChild(node);
+  // Four at most: a stack of stale toasts hides the play area.
+  while (el.toasts.children.length > 4) el.toasts.removeChild(el.toasts.firstChild);
+  setTimeout(() => {
+    node.style.transition = 'opacity 0.4s ease';
+    node.style.opacity = '0';
+    setTimeout(() => node.remove(), 420);
+  }, 2600);
+}
+
+/* ------------------------------------------------------------ save slots */
+let game = null;
+
+function slotName(slot) {
+  if (slot === SAVE.AUTOSAVE_SLOT) return t('autosave');
+  if (slot === SAVE.QUICKSAVE_SLOT) return t('quicksave');
+  return `${t('slot-n')} ${Number(slot) + 1}`;
+}
+
+function fmtPlaytime(ms) {
+  const s = Math.floor((ms ?? 0) / 1000);
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function renderSlots() {
+  if (!game) return;
+  el.slots.textContent = '';
+  for (const entry of game.save.listSlots()) {
+    const row = document.createElement('div');
+    row.className = 'slot';
+    const name = document.createElement('div');
+    name.textContent = slotName(entry.slot);
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = entry.occupied
+      ? `${fmtPlaytime(entry.meta?.playtimeMs)} · ${entry.meta?.missionsDone ?? 0}`
+      : t('empty');
+    const acts = document.createElement('div');
+    acts.className = 'acts';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn';
+    saveBtn.textContent = t('save');
+    saveBtn.disabled = entry.isAutosave;
+    saveBtn.addEventListener('click', () => {
+      const res = game.saveTo(entry.slot);
+      toast(res.ok ? t('saved') : `${t('save-failed')}: ${res.reason}`, res.ok ? 'info' : 'warn');
+      renderSlots();
+    });
+
+    const loadBtn = document.createElement('button');
+    loadBtn.className = 'btn';
+    loadBtn.textContent = t('load');
+    loadBtn.disabled = !entry.occupied;
+    loadBtn.addEventListener('click', () => {
+      const res = game.loadFrom(entry.slot);
+      toast(res.ok ? t('loaded') : `${t('save-failed')}: ${res.reason}`, res.ok ? 'info' : 'warn');
+      closePause();
+    });
+
+    acts.append(saveBtn, loadBtn);
+    row.append(name, meta, acts);
+    el.slots.appendChild(row);
+  }
+  el.storageNote.textContent = hasPersistentStorage() ? '' : t('no-storage');
+  el.storageNote.className = hasPersistentStorage() ? 'note' : 'note warn';
+}
+
+/* --------------------------------------------------------------- pause */
+function openPause() {
+  el.pause.classList.add('on');
+  globalBus.emit(Events.PAUSE, {});
+  renderSlots();
+  document.exitPointerLock?.();
+}
+function closePause() {
+  el.pause.classList.remove('on');
+  el.diagOut.textContent = '';
+  globalBus.emit(Events.RESUME, {});
+}
+function togglePause() {
+  if (el.pause.classList.contains('on')) closePause();
+  else openPause();
+}
+
+$('resume').addEventListener('click', closePause);
+$('lang-ar').addEventListener('click', () => { applyLanguage('ar'); game?.setLanguage('ar'); });
+$('lang-en').addEventListener('click', () => { applyLanguage('en'); game?.setLanguage('en'); });
+$('toggleTelemetry').addEventListener('click', () => {
+  el.telemetry.classList.toggle('on');
+  closePause();
+});
+$('diag').addEventListener('click', () => {
+  el.diagOut.textContent = game ? JSON.stringify(game.diagnostics(), null, 2) : '';
+});
+for (const btn of document.querySelectorAll('#qualityRow .btn')) {
+  btn.addEventListener('click', () => {
+    for (const b of document.querySelectorAll('#qualityRow .btn')) b.setAttribute('aria-pressed', 'false');
+    btn.setAttribute('aria-pressed', 'true');
+    game?.renderer.setQuality(btn.dataset.q);
+  });
+}
+for (const btn of document.querySelectorAll('#weatherRow .btn')) {
+  btn.addEventListener('click', () => {
+    for (const b of document.querySelectorAll('#weatherRow .btn')) b.setAttribute('aria-pressed', 'false');
+    btn.setAttribute('aria-pressed', 'true');
+    game?.setWeather(btn.dataset.w);
+  });
+}
+
+/* ---------------------------------------------------------- bus -> HUD */
+globalBus.on(Events.PROMPT, (p) => {
+  if (!p) { el.prompt.classList.remove('on'); return; }
+  el.prompt.classList.add('on');
+  el.promptKey.textContent = isTouch ? p.action : 'E';
+  el.promptLabel.textContent = p.label ?? '';
+});
+
+globalBus.on(Events.SUBTITLE, (p) => {
+  if (!p || !p.text) { el.subtitle.classList.remove('on'); return; }
+  if (p.source === 'dialogue') {
+    // The dialogue panel owns these. It is already open, it has somewhere to put
+    // the choices, and the Conversation driver decides when the scene ends - so no
+    // timer here. Auto-hiding on a delay would blank a line the player is reading.
+    el.subtitle.classList.remove('on');
+    if (p.speaker) el.dlgWho.textContent = p.speaker;
+    el.dlgLine.textContent = p.text;
+    return;
+  }
+  el.subtitle.classList.add('on');
+  el.subWho.textContent = p.speaker ?? '';
+  el.subLine.textContent = p.text;
+  clearTimeout(el.subtitle._t);
+  el.subtitle._t = setTimeout(() => el.subtitle.classList.remove('on'), (p.ms ?? 3200));
+});
+
+globalBus.on(Events.DIALOGUE_END, () => {
+  el.subtitle.classList.remove('on');
+  dlgClose();
+  // Clear the cached prompt so the next frame republishes it: the player is standing
+  // in front of someone again, and the panel that hid the prompt is now gone.
+  if (game) game.prompt = null;
+});
+
+/* ------------------------------------------------------------------ dialogue
+ * Three events drive the whole panel: DIALOGUE_START opens it, SUBTITLE feeds it
+ * one line at a time, DIALOGUE_CHOICES fills the buttons once the beat after the
+ * last line has elapsed. Nothing here polls the story graph, and nothing here
+ * decides pacing - that belongs to the Conversation driver, where it can be tested
+ * without a DOM. This file only draws.
+ */
+function dlgClose() {
+  el.dialogue.classList.remove('on');
+  el.dlgList.textContent = '';
+  el.dlgLine.textContent = '';
+  el.dlgWho.textContent = '';
+  document.body.classList.remove('in-dialogue');
+}
+
+function dlgPick(index) {
+  const res = game?.conversation?.choose(index);
+  if (!res || res.ok) return;
+  // 'not-ready' means the player pressed a number before the beat elapsed. That is
+  // a mistimed press, not a fault, and a toast for it would be noise.
+  if (res.reason === 'not-ready') return;
+  toast(res.reason === 'locked' ? t('dlg-needs') : String(res.reason), 'warn');
+}
+
+globalBus.on(Events.DIALOGUE_START, (p) => {
+  if (p?.started === false) return;   // a refused scene never opens the panel
+  el.dialogue.classList.add('on');
+  document.body.classList.add('in-dialogue');
+  el.dlgList.textContent = '';
+  el.dlgHint.textContent = isTouch ? t('dlg-cont-touch') : t('dlg-cont');
+});
+
+globalBus.on(Events.DIALOGUE_CHOICES, (p) => {
+  if (!el.dialogue.classList.contains('on')) return;
+  if (p?.speaker) el.dlgWho.textContent = p.speaker;
+  el.dlgList.textContent = '';
+  const list = p?.choices ?? [];
+  for (const c of list) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    const key = document.createElement('kbd');
+    key.textContent = String(c.index + 1);
+    const text = document.createElement('span');
+    text.textContent = c.text ?? '';
+    btn.append(key, text);
+    if (!c.available) {
+      // A locked choice is shown, not hidden. Hiding it teaches the player that
+      // conversations have one reply; showing it teaches them to go find evidence.
+      btn.disabled = true;
+      const lock = document.createElement('i');
+      lock.textContent = t('dlg-locked');
+      btn.append(lock);
+    }
+    btn.addEventListener('click', () => dlgPick(c.index));
+    el.dlgList.append(btn);
+  }
+  el.dlgHint.textContent = list.length
+    ? (isTouch ? t('dlg-pick') : `${t('dlg-pick')} · 1–${list.length}`)
+    : (isTouch ? t('dlg-cont-touch') : t('dlg-cont'));
+});
+
+el.dlgLeave.addEventListener('click', () => game?.conversation?.leave());
+
+globalBus.on(Events.DETECTION, (p) => {
+  const level = p?.level ?? p?.state ?? 'calm';
+  const on = level !== 'calm' && level !== 'unaware';
+  el.detection.classList.toggle('on', on);
+  if (!on) return;
+  el.detLabel.textContent = t(level) ?? level;
+  el.detEye.style.background = level === 'combat' ? '#b02020'
+    : level === 'alerted' ? '#d1622a' : '#c9a227';
+});
+
+globalBus.on(Events.LOST_TRACK, () => el.detection.classList.remove('on'));
+
+globalBus.on(Events.MISSION_OBJECTIVE, (p) => {
+  if (!p) return;
+  el.objText.textContent = p.text ?? p.objectiveId ?? '';
+  if (p.progress) el.objCount.textContent = `${p.progress.done ?? 0}/${p.progress.need ?? 0}`;
+});
+globalBus.on(Events.MISSION_START, (p) => {
+  if (p?.chapterId) el.chapter.textContent = p.chapterId;
+});
+globalBus.on(Events.TOAST, (p) => {
+  if (p?.kind === 'save-pruned') toast(`${t('pruned')} (${p.count})`, 'warn');
+});
+globalBus.on(Events.SAVE_FAILED, (p) => toast(`${t('save-failed')}: ${p?.reason ?? ''}`, 'warn'));
+globalBus.on(Events.AUTOSAVE, () => { if (!el.pause.classList.contains('on')) renderSlots(); });
+globalBus.on(Events.CONTEXT_LOST, () => toast(t('ctx-lost'), 'warn'));
+globalBus.on(Events.CONTEXT_RESTORED, () => toast(t('ctx-restored')));
+globalBus.on(Events.ERROR, (e) => { if (e?.message) toast(String(e.message), 'warn'); });
+
+/* -------------------------------------------------------- touch controls */
+const isTouch = (navigator.maxTouchPoints ?? 0) > 0;
+if (isTouch) el.touch.classList.add('on');
+
+let stickId = null;
+let stickOrigin = { x: 0, y: 0 };
+const STICK_R = 52;
+
+function stickStart(e) {
+  if (stickId !== null || !game) return;
+  const p = e.changedTouches[0];
+  stickId = p.identifier;
+  stickOrigin = { x: p.clientX, y: p.clientY };
+  el.stick.style.display = 'block';
+  el.stick.style.left = `${p.clientX - STICK_R - 6}px`;
+  el.stick.style.top = `${p.clientY - STICK_R - 6}px`;
+  e.preventDefault();
+}
+function stickMove(e) {
+  if (stickId === null || !game) return;
+  for (const p of e.changedTouches) {
+    if (p.identifier !== stickId) continue;
+    let dx = p.clientX - stickOrigin.x;
+    let dy = p.clientY - stickOrigin.y;
+    const m = Math.hypot(dx, dy);
+    if (m > STICK_R) { dx = (dx / m) * STICK_R; dy = (dy / m) * STICK_R; }
+    el.stickKnob.style.transform = `translate(${dx}px, ${dy}px)`;
+    // NOT mirrored for RTL. The interface mirrors, because that is what a
+    // right-to-left layout means, but directional input does not: pushing a stick
+    // toward the right edge of the screen moves the character toward the right edge
+    // of the screen in every language. Mirroring it here would hand every Arabic
+    // player inverted controls, and inverted controls are not a localization choice.
+    game.input.setTouchMove(dx / STICK_R, -(dy / STICK_R));
+    e.preventDefault();
+  }
+}
+function stickEnd(e) {
+  for (const p of e.changedTouches) {
+    if (p.identifier !== stickId) continue;
+    stickId = null;
+    el.stick.style.display = 'none';
+    el.stickKnob.style.transform = 'none';
+    game?.input.setTouchMove(0, 0);
+  }
+}
+el.stickZone.addEventListener('touchstart', stickStart, { passive: false });
+el.stickZone.addEventListener('touchmove', stickMove, { passive: false });
+el.stickZone.addEventListener('touchend', stickEnd);
+el.stickZone.addEventListener('touchcancel', stickEnd);
+
+let lookId = null;
+let lookLast = { x: 0, y: 0 };
+el.lookZone.addEventListener('touchstart', (e) => {
+  if (lookId !== null) return;
+  const p = e.changedTouches[0];
+  lookId = p.identifier;
+  lookLast = { x: p.clientX, y: p.clientY };
+  e.preventDefault();
+}, { passive: false });
+el.lookZone.addEventListener('touchmove', (e) => {
+  for (const p of e.changedTouches) {
+    if (p.identifier !== lookId) continue;
+    // Dragging right turns right, in both languages, for the same reason the stick
+    // is not mirrored: a swipe is a direction, not a piece of text.
+    game?.input.addTouchLook(p.clientX - lookLast.x, p.clientY - lookLast.y);
+    lookLast = { x: p.clientX, y: p.clientY };
+    e.preventDefault();
+  }
+}, { passive: false });
+const lookEnd = (e) => { for (const p of e.changedTouches) if (p.identifier === lookId) lookId = null; };
+el.lookZone.addEventListener('touchend', lookEnd);
+el.lookZone.addEventListener('touchcancel', lookEnd);
+
+for (const btn of document.querySelectorAll('.tbtn')) {
+  const act = btn.dataset.act;
+  if (!act) continue;
+  const held = act === 'block' || act === 'sprint' || act === 'crouch';
+  const down = (e) => {
+    e.preventDefault();
+    btn.classList.add('hit');
+    if (act === 'pause') { togglePause(); btn.classList.remove('hit'); return; }
+    if (held) game?.input.setTouchAction(act === 'crouch' ? 'crouch' : act, true);
+    else game?.input.pressAction(act);
+  };
+  const up = (e) => {
+    e?.preventDefault?.();
+    btn.classList.remove('hit');
+    if (held) game?.input.setTouchAction(act === 'crouch' ? 'crouch' : act, false);
+  };
+  btn.addEventListener('touchstart', down, { passive: false });
+  btn.addEventListener('touchend', up);
+  btn.addEventListener('touchcancel', up);
+}
+
+/* ------------------------------------------------------------ telemetry */
+let telemetryOn = false;
+let lastTelemetry = 0;
+function drawTelemetry(now) {
+  if (!el.telemetry.classList.contains('on') || !game) return;
+  if (now - lastTelemetry < 250) return;   // 4 Hz is readable; 60 Hz is a blur
+  lastTelemetry = now;
+  const d = game.diagnostics();
+  const r = d.render;
+  const over = r.drawCalls > r.maxDrawCalls || r.worstFrameMs > 32;
+  el.telemetry.className = `panel on${over ? ' warn' : ''}`;
+  el.telemetry.innerHTML =
+    `<b>${Math.round(d.render.drawCalls)}</b> calls · <b>${(d.render.triangles / 1000).toFixed(1)}k</b> tris<br>`
+    + `frame <b>${game.telemetry.frameMs.toFixed(1)}</b>ms · fps <b>${Math.round(game.telemetry.fps)}</b><br>`
+    + `render <b>${r.lastFrameMs.toFixed(1)}</b>/${r.budgetMs}ms · worst ${r.worstFrameMs.toFixed(1)}ms<br>`
+    + `${d.region} · ${d.timeOfDay}${d.indoor ? ' · indoor' : ''}<br>`
+    + `light <b>${d.lighting.lightLevel}</b> · agents ${d.agents} [${d.agentStates.join(', ')}]<br>`
+    + `pos ${d.player.x}, ${d.player.y}, ${d.player.z} · ${d.player.stance}<br>`
+    + `boot ${d.boot?.bootMs?.toFixed(0) ?? '?'}ms`;
+}
+
+/* ------------------------------------------------------------- vitals */
+const lastVitals = {};
+function drawVitals() {
+  if (!game) return;
+  const p = game.player;
+  const hf = Math.round(p.healthFraction * 100);
+  const sf = Math.round(p.staminaFraction * 100);
+  // Written only when a value actually changed. Setting style.width every frame
+  // forces a layout pass sixty times a second for nothing.
+  if (hf !== lastVitals.h) {
+    el.health.querySelector('.fill').style.width = `${hf}%`;
+    el.health.classList.toggle('low', hf <= 25);
+    lastVitals.h = hf;
+  }
+  if (sf !== lastVitals.s) {
+    el.stamina.querySelector('.fill').style.width = `${sf}%`;
+    el.stamina.classList.toggle('low', sf <= 15);
+    lastVitals.s = sf;
+  }
+}
+
+/* ---------------------------------------------------------------- boot */
+function setBoot(pct, key) {
+  el.bootbar.style.width = `${pct}%`;
+  el.bootstatus.textContent = t(key);
+}
+
+async function boot() {
+  applyLanguage('ar');
+  setBoot(12, 'boot-start');
+
+  // Let the browser paint the boot screen before the synchronous world build, or
+  // the player stares at an unstyled page for a second and assumes it is broken.
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  setBoot(38, 'boot-world');
+  await new Promise((r) => setTimeout(r, 16));
+
+  try {
+    const res = bootGame({ canvas: $('view'), bus: globalBus, language: lang });
+    game = res.game;
+    for (const problem of res.report.problems) toast(problem, 'warn');
+    setBoot(100, 'boot-ready');
+
+    // The pointer lock is requested on a gesture, because browsers reject it
+    // otherwise and the rejection is not something to surface at boot.
+    el.begin.style.display = '';
+    el.begin.addEventListener('click', () => {
+      el.boot.classList.add('hidden');
+      setTimeout(() => { el.boot.style.display = 'none'; }, 620);
+      if (!isTouch) $('view').requestPointerLock?.();
+      globalBus.emit(Events.RESUME, {});
+    }, { once: true });
+
+    // Vitals and telemetry run off the page's own rAF rather than the game's, so a
+    // paused game still shows a correct HUD.
+    const uiLoop = (now) => { drawVitals(); drawTelemetry(now); requestAnimationFrame(uiLoop); };
+    requestAnimationFrame(uiLoop);
+  } catch (err) {
+    setBoot(100, 'boot-start');
+    el.bootstatus.textContent = `${err?.message ?? err}`;
+    el.bootstatus.style.color = '#d1622a';
+    // eslint-disable-next-line no-console
+    console.error('[boot]', err);
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  // Number keys answer a conversation, checked first so a scene cannot be reached by
+  // a stray binding. Out of range is refused by the driver, which is the right place
+  // for that decision rather than a second copy of the rules here.
+  if (game?.conversation?.active && /^Digit[1-9]$/.test(e.code)) {
+    dlgPick(Number(e.code.slice(5)) - 1);
+    e.preventDefault();
+    return;
+  }
+  if (e.code === 'Escape') {
+    if (el.boot.style.display !== 'none') return;
+    // Mid-scene, Escape walks away and the game loop handles it. Opening the pause
+    // menu over a conversation would leave two things claiming the same key.
+    if (game?.conversation?.active) return;
+    togglePause();
+    e.preventDefault();
+  }
+  if (e.code === 'F1') { el.telemetry.classList.toggle('on'); e.preventDefault(); }
+});
+
+// A hidden tab should not keep simulating: the accumulator would fill and the
+// player would return to a character who ran into a wall for five minutes.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    globalBus.emit(Events.PAUSE, {});
+    el.pause.classList.contains('on') || openPause();
+  }
+});
+
+window.addEventListener('error', (e) => {
+  toast(String(e.message ?? 'error'), 'warn');
+});
+
+boot();
+</script>
+</body>
+</html>

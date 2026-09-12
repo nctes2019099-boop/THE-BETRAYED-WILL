@@ -1,0 +1,1100 @@
+/**
+ * THE BETRAYED WILL — runtime-test.mjs
+ *
+ * The integration suite for the browser layer: boot, the frame loop, region
+ * transitions, and the seam between what is drawn and what is perceived.
+ *
+ * Everything else in this repository tests the simulation, which is pure and runs
+ * anywhere. This suite tests the part that normally only runs in a browser, by
+ * injecting a stub renderer and driving the real loop. The WebGL submission is the
+ * only thing not covered, and it is the only thing that cannot be.
+ *
+ * The most important group here is III. A stealth game has one unforgivable failure:
+ * a guard who sees the player in what is visibly shadow. That happens when the
+ * brightness of the picture and the brightness the AI is told come from different
+ * places, and it is invisible in a screenshot and invisible in a unit test. So this
+ * suite asserts the seam itself - that the lightLevel handed to the perception system
+ * is the one the lighting rig chose for that exact position - and then asserts the
+ * behaviour that follows from it.
+ *
+ * Run: node tests/runtime-test.mjs
+ */
+
+import { describe, test, assert, runAndExit, measure } from './harness.mjs';
+import { EventBus, Events } from '../src/core/bus.js';
+import { CAM, MOVE, PERF, SAVE, STEALTH } from '../src/core/constants.js';
+import { Vec3 } from '../src/core/math.js';
+import { Game, FIXED_DT, MAX_FRAME_DT } from '../src/main.js';
+import { LightingRig, TIME_OF_DAY, INTERIOR_DIMMING } from '../src/render/lighting.js';
+import { RegionMesh } from '../src/render/region-mesh.js';
+import { MaterialLibrary } from '../src/render/materials.js';
+import { World } from '../src/sim/world.js';
+import { StoryState } from '../src/sim/story-state.js';
+import { CLUE_MAP } from '../src/content/story.js';
+
+const CLUE = Object.keys(CLUE_MAP)[0];
+import { AIState, effectiveDetectRange, exposureFor, perceptionProbe } from '../src/sim/ai.js';
+import { REGIONS, REGION_MAP } from '../src/content/world-data.js';
+import { MemoryStorage } from '../src/sim/save.js';
+import { Conversation, TREE_BY_LANDMARK, muteEvents } from '../src/sim/conversation.js';
+import { DialogueWalker } from '../src/sim/dialogue.js';
+import { DIALOGUE_TREES, Flags } from '../src/content/dialogue.js';
+import { CLUES, MISSIONS } from '../src/content/story.js';
+import { LANDMARKS } from '../src/content/world-data.js';
+import * as THREE from '../vendor/three/three.module.js';
+
+/** A renderer that records instead of drawing. */
+function stubRenderer(opts = {}) {
+  return {
+    scene: opts.scene ?? new THREE.Scene(),
+    aspect: 16 / 9,
+    quality: opts.quality ?? 'medium',
+    renders: 0,
+    lastCamera: null,
+    disposed: false,
+    info: {
+      drawCalls: 0, triangles: 0, geometries: 0, textures: 0, programs: 0,
+      lastFrameMs: 0, worstFrameMs: 0, overBudgetFrames: 0,
+      budgetMs: PERF.RENDER_BUDGET_MS, maxDrawCalls: PERF.MAX_DRAW_CALLS,
+      quality: 'medium', size: { w: 1280, h: 720, ratio: 1 },
+    },
+    render(camera) { this.renders++; this.lastCamera = camera; return 0.4; },
+    syncCamera() {},
+    resize() { return this.info.size; },
+    setQuality(q) { this.quality = q; return true; },
+    dispose() { this.disposed = true; },
+  };
+}
+
+/** Boot a game headlessly and capture the truth handed to the AI each step. */
+function bootGame(overrides = {}) {
+  const bus = new EventBus();
+  const game = new Game({
+    // A real (in-memory) backend, so this is a normal boot. V5 covers the case where
+    // the browser offers no storage at all, which is a different situation and must
+    // be reported differently.
+    bus, language: 'ar', seed: 'mesopotamia', storage: new MemoryStorage(),
+    rendererFactory: stubRenderer, ...overrides,
+  });
+  const report = game.boot();
+  game.running = false;
+  return { game, bus, report };
+}
+
+/**
+ * Drive N frames through the real loop.
+ *
+ * 17ms rather than exactly FIXED_DT*1000. Stepping at precisely the step boundary is
+ * the one interval where floating-point accumulation is pathological: 16.666666ms
+ * rounds to a hair under 1/60s, so the accumulator misses the threshold on one frame
+ * and catches up with two on the next. Real frames are never exactly that, and a
+ * suite that only passes at a frame time no display produces is testing the rounding,
+ * not the loop.
+ */
+function step(game, n = 1, frameMs = 17) {
+  for (let i = 0; i < n; i++) {
+    game._frame((game.lastNow || 0) + frameMs);
+  }
+}
+
+describe('runtime — boot', () => {
+  test('I1 · the game boots headlessly inside the declared boot budget', () => {
+    const { report } = bootGame();
+    assert.ok(report.ok, 'boot must report success');
+    assert.lt(report.timings.bootMs, PERF.BOOT_BUDGET_MS,
+      `boot took ${report.timings.bootMs.toFixed(0)}ms against ${PERF.BOOT_BUDGET_MS}ms`);
+  });
+
+  test('I2 · boot leaves no unresolved problem on a normal start', () => {
+    // storage:null is an explicit "no backend", which is a headless caller asking for
+    // memory-only saves, so it must not be reported as a problem.
+    const { report } = bootGame();
+    assert.deepEqual(report.problems, [], `unexpected problems: ${report.problems.join('; ')}`);
+  });
+
+  test('I3 · every system the loop depends on exists after boot', () => {
+    const { game } = bootGame();
+    for (const name of ['world', 'mats', 'scene', 'lighting', 'renderer', 'camera3d',
+      'state', 'missions', 'save', 'input', 'playerRig', 'player', 'camera',
+      'squad', 'regionMesh', 'space']) {
+      assert.ok(game[name], `${name} was not created by boot`);
+    }
+    assert.ok(game.player.pos instanceof Vec3, 'the player position must be a Vec3');
+    assert.ok(game.camera3d.isPerspectiveCamera, 'a Three.js camera must exist');
+  });
+
+  test('I4 · the scene holds the region geometry and the player rig', () => {
+    const { game } = bootGame();
+    const names = [];
+    game.scene.traverse((o) => { if (o.name) names.push(o.name); });
+    assert.ok(names.some((n) => n.startsWith('region:')), 'the region group must be in the scene');
+    assert.ok(names.some((n) => n.startsWith('ground:')), 'the ground must be in the scene');
+    assert.ok(names.some((n) => n === 'char:player'), 'the player rig must be in the scene');
+    assert.ok(names.some((n) => n.startsWith('solids:')), 'merged solids must be in the scene');
+  });
+
+  test('I5 · guards actually spawn in a region with walkable floor', () => {
+    // NavGrid reports counts under `stats`, not as a top-level property. Reading the
+    // wrong name yields 0, which yields no guards anywhere in the game - a build that
+    // boots cleanly, renders correctly, and has no enemies in it at all.
+    const { game } = bootGame();
+    assert.gt(game.space.nav.stats.walkable, 40, 'the starting region must have walkable floor');
+    assert.gt(game.squad.agents.length, 0, 'guards must spawn');
+    assert.equal(game.npcRigs.size, game.squad.agents.length, 'every agent needs a rig');
+    for (const a of game.squad.agents) {
+      assert.ok(Number.isFinite(a.body.pos.x) && Number.isFinite(a.body.pos.z),
+        `${a.id} spawned at a non-finite position`);
+      assert.ok(game.space.nav.isWalkableAt(a.body.pos.x, a.body.pos.z),
+        `${a.id} spawned inside non-walkable geometry`);
+    }
+  });
+
+  test('I6 · booting is not so slow that a player would notice', () => {
+    const ms = measure(() => {
+      const g = new Game({ bus: new EventBus(), storage: null, rendererFactory: stubRenderer });
+      g.boot();
+      g.dispose();
+    }, 3, 1);
+    assert.lt(ms, PERF.BOOT_BUDGET_MS, `a cold boot averaged ${ms.toFixed(0)}ms`);
+  });
+});
+
+describe('runtime — the frame loop', () => {
+  test('II1 · one rendered frame at 60Hz runs exactly one fixed step', () => {
+    const { game } = bootGame();
+    const before = game.steps;
+    step(game, 1);
+    assert.equal(game.steps - before, 1, 'a 17ms frame is one step');
+  });
+
+  test('II1b · the very first frame has no previous timestamp and assumes one step', () => {
+    // lastNow starts at zero, so frame one cannot compute a delta. Assuming a single
+    // fixed step is the safe answer; assuming zero would freeze the opening frame and
+    // assuming the wall clock would teleport the player.
+    const { game } = bootGame();
+    assert.equal(game.lastNow, 0, 'the clock starts unset');
+    step(game, 1, 5000);
+    assert.equal(game.steps, 1, 'a five-second first frame still simulates one step');
+  });
+
+  test('II2 · a long frame runs several steps and catches up', () => {
+    const { game } = bootGame();
+    const before = game.steps;
+    step(game, 1);                       // prime the clock: the first frame has no delta
+    const primed = game.steps;
+    step(game, 1, 51);
+    assert.equal(game.steps - primed, 3, 'three frames of time is three steps');
+  });
+
+  test('II3 · a stalled frame cannot spiral into a freeze', () => {
+    // Ten seconds in the background must not produce six hundred steps on return.
+    const { game } = bootGame();
+    const before = game.steps;
+    const t0 = game.lastNow || 0;
+    game._frame(t0 + 10_000);
+    const steps = game.steps - before;
+    assert.lte(steps, 5, `a 10s stall ran ${steps} steps; the accumulator must be capped`);
+    assert.equal(game.accumulator, 0, 'and the leftover time must be dropped, not carried');
+  });
+
+  test('II4 · positions stay finite over a sustained run', () => {
+    const { game } = bootGame();
+    game.input.handleEvent('keydown', { code: 'KeyW' });
+    for (let i = 0; i < 600; i++) {
+      step(game, 1);
+      const p = game.player.pos;
+      assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z),
+        `player position went non-finite at step ${i}`);
+      assert.ok(game.player.pos.isFiniteVec(), 'and the vector reports itself finite');
+    }
+    for (const a of game.squad.agents) {
+      assert.ok(a.body.pos.isFiniteVec(), `${a.id} position went non-finite`);
+    }
+  });
+
+  test('II5 · holding forward moves the player through the real loop', () => {
+    const { game } = bootGame();
+    const start = { x: game.player.pos.x, z: game.player.pos.z };
+    game.input.handleEvent('keydown', { code: 'KeyW' });
+    for (let i = 0; i < 90; i++) step(game, 1);
+    const moved = Math.hypot(game.player.pos.x - start.x, game.player.pos.z - start.z);
+    assert.gt(moved, 0.2, `the player moved ${moved.toFixed(3)}m while holding forward`);
+    game.input.handleEvent('keyup', { code: 'KeyW' });
+  });
+
+  test('II6 · pausing stops the simulation but keeps the object alive', () => {
+    const { game, bus } = bootGame();
+    bus.emit(Events.PAUSE, {});
+    const before = game.steps;
+    step(game, 10);
+    assert.equal(game.steps, before, 'a paused game must not simulate');
+    bus.emit(Events.RESUME, {});
+    step(game, 2);
+    assert.equal(game.steps, before + 2, 'and must resume exactly where it left off');
+  });
+
+  test('II7 · the Escape binding pauses through the input layer', () => {
+    const { game } = bootGame();
+    assert.equal(game.paused, false, 'not paused to begin with');
+    game.input.handleEvent('keydown', { code: 'Escape' });
+    game.input.handleEvent('keyup', { code: 'Escape' });
+    step(game, 1);
+    assert.equal(game.paused, true, 'Escape must pause');
+  });
+
+  test('II8 · the rendered camera is a copy of the simulation camera', () => {
+    // The simulation camera resolves collisions, penetration and framing, and has 40
+    // tests of its own. The Three.js camera must be exactly where it says, or all of
+    // that work is describing a viewpoint the player is not looking from.
+    const { game } = bootGame();
+    for (let i = 0; i < 20; i++) step(game, 1);
+    const c = game.camera;
+    const r = game.camera3d;
+    assert.close(r.position.x, c.position.x, 1e-9, 'camera X must match');
+    assert.close(r.position.y, c.position.y, 1e-9, 'camera Y must match');
+    assert.close(r.position.z, c.position.z, 1e-9, 'camera Z must match');
+    assert.close(r.fov, c.fov, 1e-6, 'the field of view must match');
+    assert.equal(game.renderer.renders, 20, 'one submission per frame');
+    assert.ok(game.renderer.lastCamera === game.camera3d, 'the game camera is the one submitted');
+  });
+
+  test('II9 · a frame stays inside the render budget for the built geometry', () => {
+    const { game } = bootGame();
+    const ms = measure(() => step(game, 1), 300, 30);
+    assert.lt(ms, PERF.FRAME_BUDGET_MS,
+      `a full frame averaged ${ms.toFixed(3)}ms against a ${PERF.FRAME_BUDGET_MS}ms budget`);
+  });
+
+  test('II10 · noise from the simulation reaches perception, and decays', () => {
+    // The perception truth must carry the noise the movement system reported. Two
+    // sources for one fact is how guards end up hearing footsteps nobody made.
+    const { game, bus } = bootGame();
+    bus.emit(Events.NOISE_EMITTED, { radius: 9.5 });
+    step(game, 1);
+    assert.close(game.lastTruth.noiseRadius, 9.5, 1e-9, 'the emitted radius must be the one perceived');
+    for (let i = 0; i < 60; i++) step(game, 1);
+    assert.equal(game.lastTruth.noiseRadius, 0,
+      'noise must decay rather than alert the region forever');
+  });
+
+  test('II11 · a smaller noise does not overwrite a louder one still sounding', () => {
+    const { game, bus } = bootGame();
+    bus.emit(Events.NOISE_EMITTED, { radius: 12 });
+    bus.emit(Events.NOISE_EMITTED, { radius: 3 });
+    step(game, 1);
+    assert.close(game.lastTruth.noiseRadius, 12, 1e-9,
+      'the peak within the window is what a guard would hear');
+  });
+});
+
+describe('runtime — what is drawn is what is perceived', () => {
+  test('III1 · the lightLevel the AI receives is the one the rig chose', () => {
+    const { game } = bootGame();
+    for (let i = 0; i < 10; i++) step(game, 1);
+    const truth = game.lastTruth;
+    assert.ok(truth, 'a perception truth must have been built');
+    const p = game.player.pos;
+    const expected = game.lighting.lightLevelAt(p.x, p.z).level;
+    assert.close(truth.lightLevel, expected, 1e-12,
+      'perception and rendering must read the same light at the same position');
+  });
+
+  test('III2 · night is darker than day by the declared amounts', () => {
+    assert.close(TIME_OF_DAY.night.lightLevel, STEALTH.LIGHT_EXPOSURE_NIGHT, 1e-12,
+      'the night preset must use the declared stealth value');
+    assert.close(TIME_OF_DAY.day.lightLevel, STEALTH.LIGHT_EXPOSURE_DAY, 1e-12,
+      'and so must day');
+    assert.lt(TIME_OF_DAY.night.lightLevel, TIME_OF_DAY.day.lightLevel,
+      'night must actually be darker');
+  });
+
+  test('III3 · every region has a lighting preset, so none falls back silently', () => {
+    for (const r of REGIONS) {
+      assert.ok(TIME_OF_DAY[r.timeOfDay],
+        `${r.id} declares timeOfDay "${r.timeOfDay}", which has no preset`);
+    }
+  });
+
+  test('III4 · a night region really is harder to be seen in than a day region', () => {
+    // The behavioural consequence of III1. If the numbers are right but nothing
+    // follows from them, stealth is decoration.
+    const night = bootGame({});
+    night.game.setRegion(REGIONS.find((r) => r.timeOfDay === 'night').id);
+    const day = bootGame({});
+    day.game.setRegion(REGIONS.find((r) => r.timeOfDay === 'day').id);
+
+    const levelOf = (g) => {
+      step(g, 2);
+      assert.ok(g.lastTruth, 'the loop must have built a perception truth');
+      return g.lastTruth;
+    };
+    const n = levelOf(night.game);
+    const d = levelOf(day.game);
+    assert.lt(n.lightLevel, d.lightLevel, 'night exposure must be lower');
+
+    const rangeN = effectiveDetectRange(exposureFor({
+      lightLevel: n.lightLevel, stance: 'stand', speed: 0, isNight: n.isNight,
+    }), n.isNight);
+    const rangeD = effectiveDetectRange(exposureFor({
+      lightLevel: d.lightLevel, stance: 'stand', speed: 0, isNight: d.isNight,
+    }), d.isNight);
+    assert.lt(rangeN, rangeD,
+      `a guard sees ${rangeN.toFixed(1)}m at night and ${rangeD.toFixed(1)}m by day`);
+    assert.gt(rangeN, STEALTH.DETECT_RANGE_MIN * 0.5, 'and night must not mean blind');
+  });
+
+  test('III5 · standing in firelight raises exposure toward the torch value', () => {
+    const { game } = bootGame();
+    // Find a region with a hearth or torch and stand in it.
+    let target = null;
+    for (const r of REGIONS) {
+      const space = game.world.region(r.id);
+      const fire = (space.props ?? []).find((p) => p.kind === 'fire' || p.kind === 'flame');
+      if (fire) { target = { region: r.id, fire }; break; }
+    }
+    assert.ok(target, 'some region must contain a fire to test against');
+    game.setRegion(target.region);
+    const fires = LightingRig.firesFrom(game.regionMesh);
+    assert.gt(fires.length, 0, 'fires must be collected for the exposure model');
+
+    const open = game.lighting.lightLevelAt(0, 0).level;
+    const atFire = game.lighting.lightLevelAt(target.fire.x, target.fire.z);
+    assert.gt(atFire.level, open, 'firelight must make the player more visible');
+    assert.ok(atFire.nearFire, 'and must report that the player is in the light');
+    assert.lte(atFire.level, STEALTH.LIGHT_EXPOSURE_TORCH + 1e-9,
+      'never brighter than the declared torch value');
+  });
+
+  test('III6 · an interior is dimmer than the same hour outdoors', () => {
+    const indoor = REGION_MAP['palace-hall'];
+    const rig = new LightingRig(new THREE.Scene(), { shadows: false });
+    rig.apply(indoor, { weather: 'clear', fires: [] });
+    const inside = rig.lightLevelAt(0, 0).level;
+    const outside = indoor.timeOfDay === 'night'
+      ? TIME_OF_DAY.night.lightLevel
+      : TIME_OF_DAY[indoor.timeOfDay].lightLevel;
+    assert.close(inside, outside * INTERIOR_DIMMING, 1e-9,
+      'interior dimming must be the declared fraction');
+    assert.lt(inside, outside, 'and an interior must be darker');
+  });
+
+  test('III7 · weather multiplies exposure by the declared factor', () => {
+    const rig = new LightingRig(new THREE.Scene(), { shadows: false });
+    const region = REGION_MAP['palace-court'];
+    rig.apply(region, { weather: 'clear', fires: [] });
+    const clear = rig.lightLevelAt(0, 0).level;
+    for (const [weather, factor] of Object.entries(STEALTH.WEATHER_EXPOSURE)) {
+      rig.apply(region, { weather: weather, fires: [] });
+      const got = rig.lightLevelAt(0, 0).level;
+      assert.close(got, clear * factor, 1e-9,
+        `${weather} must scale exposure by the declared ${factor}`);
+    }
+  });
+
+  test('III8 · an unknown weather name cannot corrupt exposure', () => {
+    const { game } = bootGame();
+    assert.equal(game.setWeather('apocalypse'), false, 'an undeclared weather must be refused');
+    assert.equal(game.weather, 'clear', 'and must leave the current weather alone');
+    assert.ok(game.setWeather('storm'), 'a declared one is accepted');
+  });
+
+  test('III9 · a guard cannot see a player who is out of range, and can when close', () => {
+    // The fairness invariant end to end: with the game's own truth, perception must
+    // fail at distance and succeed nearby, rather than being omnipresent.
+    const { game } = bootGame();
+    game.setRegion(REGIONS.find((r) => r.timeOfDay === 'night').id);
+    const agent = game.squad.agents[0];
+    assert.ok(agent, 'a guard is needed to test perception');
+
+    step(game, 2);
+    const truth = game.lastTruth;
+    const ap = agent.body.pos;
+
+    const far = { ...truth, playerPos: new Vec3(ap.x + 60, ap.y, ap.z + 60) };
+    const near = { ...truth, playerPos: new Vec3(ap.x + 1.5, ap.y, ap.z) };
+    // Facing the agent, so the cone is not what makes the difference.
+    const probeFar = perceptionProbe(agent, far, { losFallback: true });
+    const probeNear = perceptionProbe(agent, near, { losFallback: true });
+    assert.equal(probeFar.inRange, false, 'a player 60m away at night must not be seen');
+    assert.ok(probeNear.inRange || probeNear.cone === 0,
+      'a player at 1.5m is in range unless genuinely outside the view cone');
+  });
+
+  test('III10 · crouching in the dark is meaningfully harder to see than sprinting in day', () => {
+    const crouched = exposureFor({
+      lightLevel: TIME_OF_DAY.night.lightLevel, stance: 'crouch', speed: 0, isNight: true,
+    });
+    const sprinting = exposureFor({
+      lightLevel: TIME_OF_DAY.day.lightLevel, stance: 'stand', speed: MOVE.SPRINT_SPEED, isNight: false,
+    });
+    assert.lt(crouched, sprinting * 0.5,
+      `crouched at night ${crouched.toFixed(3)} vs sprinting by day ${sprinting.toFixed(3)}`);
+    assert.gt(crouched, 0, 'but never literally invisible');
+  });
+});
+
+describe('runtime — regions and transitions', () => {
+  test('IV1 · travelling to a region rebuilds it and disposes the old one', () => {
+    const { game } = bootGame();
+    const oldMesh = game.regionMesh;
+    let disposed = false;
+    oldMesh.dispose = () => { disposed = true; };
+    const target = game.space.doors[0]?.toRegion;
+    assert.ok(target, 'the starting region must have a door to travel through');
+    game.travelTo(target);
+    assert.equal(game.regionId, target, 'the region changed');
+    assert.ok(disposed, 'the previous region mesh must be disposed, not leaked');
+    assert.notEqual(game.regionMesh, oldMesh, 'and a new one built');
+    assert.ok(game.scene.children.includes(game.regionMesh.group), 'in the scene');
+    assert.ok(!game.scene.children.includes(oldMesh.group), 'with the old one removed');
+  });
+
+  test('IV2 · arriving through a door puts the player at the door back', () => {
+    const { game } = bootGame();
+    const from = game.regionId;
+    const target = game.space.doors[0].toRegion;
+    game.travelTo(target);
+    const back = game.world.region(target).doorTo(from);
+    assert.ok(back, 'the destination must have a door leading back');
+    const p = game.player.pos;
+    const d = Math.hypot(p.x - back.spawn.x, p.z - back.spawn.z);
+    assert.lt(d, 1.0,
+      `the player arrived ${d.toFixed(2)}m from the return door; they must be able to turn around and leave`);
+  });
+
+  test('IV3 · lighting follows the region', () => {
+    const { game } = bootGame();
+    const night = REGIONS.find((r) => r.timeOfDay === 'night');
+    game.setRegion(night.id);
+    assert.equal(game.lighting.applied.timeOfDay, 'night', 'the preset must follow the region');
+    assert.equal(game.lighting.isNight, true, 'and report night');
+    const day = REGIONS.find((r) => r.timeOfDay === 'day');
+    game.setRegion(day.id);
+    assert.equal(game.lighting.isNight, false, 'and day');
+  });
+
+  test('IV4 · every region can be entered and meshed without error', () => {
+    const { game } = bootGame();
+    for (const r of REGIONS) {
+      let err = null;
+      try { game.setRegion(r.id); step(game, 2); } catch (e) { err = e; }
+      assert.ok(!err, `${r.id} failed to enter: ${err?.message ?? err}`);
+      assert.ok(game.player.pos.isFiniteVec(), `${r.id} put the player at a non-finite position`);
+      assert.equal(game.regionId, r.id, `${r.id} is now current`);
+    }
+  });
+
+  test('IV5 · no region exceeds the declared draw-call budget', () => {
+    const mats = new MaterialLibrary({ textures: false });
+    const world = new World({ seed: 'mesopotamia' });
+    let worst = 0;
+    let worstId = null;
+    for (const r of REGIONS) {
+      const mesh = new RegionMesh(world.region(r.id), mats);
+      let calls = 0;
+      mesh.group.traverse((o) => { if (o.isMesh) calls++; });
+      if (calls > worst) { worst = calls; worstId = r.id; }
+      mesh.dispose();
+    }
+    assert.lte(worst, PERF.MAX_DRAW_CALLS,
+      `${worstId} needs ${worst} draw calls against a budget of ${PERF.MAX_DRAW_CALLS}`);
+  });
+
+  test('IV6 · a prompt is published when the player stands at a doorway', () => {
+    const { game, bus } = bootGame();
+    const prompts = [];
+    bus.on(Events.PROMPT, (p) => prompts.push(p));
+    const door = game.space.doors[0];
+    assert.ok(door, 'a door is needed');
+    game.player.setPosition(door.world.x, game.space.heightAt(door.world.x, door.world.z), door.world.z);
+    step(game, 2);
+    assert.gt(prompts.length, 0, 'standing at a door must produce a prompt');
+    const last = prompts[prompts.length - 1];
+    assert.equal(last.kind, 'door', 'and must be a door prompt');
+    assert.ok(last.label, 'with a label the player can read');
+  });
+
+  test('IV7 · the prompt is not re-emitted every frame', () => {
+    // A HUD that rewrites its text sixty times a second for text that has not
+    // changed is a stutter caused entirely by the interface.
+    const { game, bus } = bootGame();
+    let count = 0;
+    bus.on(Events.PROMPT, () => count++);
+    const door = game.space.doors[0];
+    game.player.setPosition(door.world.x, game.space.heightAt(door.world.x, door.world.z), door.world.z);
+    step(game, 1);
+    const afterFirst = count;
+    step(game, 60);
+    assert.equal(count, afterFirst, 'an unchanged prompt must not be re-emitted');
+  });
+});
+
+describe('runtime — saves, language and teardown', () => {
+  test('V1 · the game saves and loads through its own save system', () => {
+    const { game } = bootGame();
+    step(game, 30);
+    game.missions.state.playtimeMs = 4242;
+    game.missions.state.clues.add(CLUE);
+    const res = game.saveTo(0);
+    assert.ok(res.ok, `save failed: ${res.reason}`);
+    game.missions.state.playtimeMs = 1;
+    const loaded = game.loadFrom(0);
+    assert.ok(loaded.ok, `load failed: ${loaded.reason}`);
+    assert.equal(game.missions.state.playtimeMs, 4242, 'progress must come back');
+  });
+
+  test('V2 · autosave is wired to the game’s own state', () => {
+    const { game, bus } = bootGame();
+    bus.emit(Events.CHAPTER_START, {});
+    assert.ok(game.save.has(SAVE.AUTOSAVE_SLOT), 'a chapter start must autosave');
+    const loaded = game.save.load(SAVE.AUTOSAVE_SLOT);
+    assert.ok(loaded.ok, 'and the autosave must be readable');
+  });
+
+  test('V3 · language switching reaches the state and the bus', () => {
+    const { game, bus } = bootGame();
+    const seen = [];
+    bus.on(Events.LANGUAGE_CHANGED, (p) => seen.push(p.language));
+    game.setLanguage('en');
+    assert.equal(game.language, 'en');
+    assert.equal(game.state.language, 'en', 'the story state must follow');
+    game.setLanguage('ar');
+    assert.deepEqual(seen, ['en', 'ar'], 'both changes must be announced');
+    game.setLanguage('klingon');
+    assert.equal(game.language, 'ar', 'an unsupported language must not be accepted');
+  });
+
+  test('V4 · teardown releases everything it created', () => {
+    const { game } = bootGame();
+    const meshDispose = [];
+    game.regionMesh.dispose = () => meshDispose.push('region');
+    const rigDispose = [];
+    game.playerRig.dispose = () => rigDispose.push('player');
+    game.lighting.dispose = () => rigDispose.push('lighting');
+    game.mats.dispose = () => rigDispose.push('materials');
+    game.dispose();
+    assert.equal(game.running, false, 'the loop must stop');
+    assert.ok(game.renderer.disposed, 'the renderer must be disposed');
+    assert.deepEqual(meshDispose, ['region'], 'the region mesh must be disposed');
+    assert.includes(rigDispose, 'player', 'the player rig');
+    assert.includes(rigDispose, 'lighting', 'the lighting rig');
+    assert.includes(rigDispose, 'materials', 'the material library');
+  });
+
+  test('V5 · a boot with no storage says so instead of failing later', () => {
+    const game = new Game({ bus: new EventBus(), storage: null, rendererFactory: stubRenderer });
+    const report = game.boot();
+    assert.ok(report.problems.some((p) => /storage/i.test(p)),
+      'the player must be told progress will not survive the session');
+    assert.equal(game.save.volatile, true, 'and the save system must agree');
+    assert.ok(game.saveTo(0).ok, 'saving must still work in memory');
+    game.dispose();
+  });
+
+  test('V6 · diagnostics describe a live game without throwing', () => {
+    const { game } = bootGame();
+    step(game, 5);
+    let d = null;
+    assert.doesNotThrow(() => { d = game.diagnostics(); });
+    assert.equal(d.region, 'palace-court', 'the region is named');
+    assert.ok(d.lighting.lightLevel >= 0 && d.lighting.lightLevel <= 1, 'exposure is in range');
+    assert.ok(Number.isFinite(d.player.x), 'the player position is reported');
+    assert.ok(d.render.maxDrawCalls === PERF.MAX_DRAW_CALLS, 'the budget is reported');
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * VI — conversation and interaction.
+ *
+ * This group exists because the dialogue system was complete, tested and
+ * unreachable: DialogueWalker had its own coverage, index.html listened for
+ * subtitles, and nothing in the runtime ever created a walker. Fourteen trees
+ * nobody could open and every DIALOGUE objective impossible to complete, in a
+ * build that boots cleanly and renders correctly. The gap was invisible to every
+ * existing suite because each of them tested a layer that worked.
+ * ---------------------------------------------------------------------- */
+describe('runtime — conversation and interaction', () => {
+  /** A state holding everything, so gated branches are open. */
+  function enrich(state) {
+    for (const c of CLUES) state.grantClue(c.id);
+    for (const f of Object.values(Flags)) state.setFlag(f, 'mission');
+    return state;
+  }
+
+  /** Drive a conversation to its end the way a player would. */
+  function playThrough(game, maxTurns = 400) {
+    let turns = 0;
+    while (game.conversation.active && turns < maxTurns) {
+      game.conversation.update(0.4);          // let each line finish
+      const view = game.conversation.view();
+      if (!view) break;
+      if (!view.readyForInput) { game.conversation.update(0.4); continue; }
+      const open = view.choices.filter((c) => c.available);
+      if (open.length) game.conversation.choose(open[0].index);
+      else game.conversation.skipOrAdvance();
+      turns++;
+    }
+    return turns;
+  }
+
+  test('VI1 · boot creates the walker and the conversation driver', () => {
+    const { game } = bootGame();
+    assert.ok(game.walker instanceof DialogueWalker, 'a DialogueWalker must exist');
+    assert.ok(game.conversation instanceof Conversation, 'a Conversation driver must exist');
+    assert.equal(game.conversation.active, false, 'no scene is open at boot');
+    assert.equal(game.conversation.state, game.missions.state,
+      'the driver must share the mission state, not a copy of it');
+  });
+
+  test('VI2 · every dialogue landmark resolves to a real tree', () => {
+    // Fourteen landmarks declare interact:"dialogue" and there are fourteen trees.
+    // A landmark with no tree is a face the player can talk to that says nothing.
+    const dialogueLandmarks = LANDMARKS.filter((l) => l.interact === 'dialogue');
+    assert.equal(dialogueLandmarks.length, DIALOGUE_TREES.length,
+      'the dialogue landmarks and the trees should be the same count');
+    for (const lm of dialogueLandmarks) {
+      const treeId = TREE_BY_LANDMARK[lm.id];
+      assert.ok(treeId, `landmark "${lm.id}" offers dialogue but no tree is bound to it`);
+      assert.ok(DIALOGUE_TREES.some((t) => t.id === treeId), `"${treeId}" is not a real tree`);
+    }
+    for (const tree of DIALOGUE_TREES) {
+      assert.ok(TREE_BY_LANDMARK[tree.landmark],
+        `tree "${tree.id}" names landmark "${tree.landmark}", which does not point back`);
+    }
+  });
+
+  test('VI3 · walking up to a speaker and pressing interact opens the scene', () => {
+    const { game } = bootGame();
+    const lm = LANDMARKS.find((l) => l.interact === 'dialogue' && l.region === game.regionId);
+    const target = lm ?? LANDMARKS.find((l) => l.interact === 'dialogue');
+    if (lm) {
+      assert.ok(game.space.interactables.some((i) => i.id === lm.id),
+        'a dialogue landmark in this region must be interactable');
+    } else {
+      game.setRegion(target.region);
+    }
+    const it = game.space.interactables.find((i) => i.kind === 'dialogue');
+    assert.ok(it, 'the region must contain a dialogue interactable');
+    enrich(game.missions.state);
+    game.player.setPosition(it.x, game.space.heightAt(it.x, it.z), it.z);
+    game.input.handleEvent('keydown', { code: 'KeyE' });
+    step(game, 1);
+    assert.equal(game.conversation.active, true, 'interact must open the conversation');
+    assert.equal(game.conversation.treeId, TREE_BY_LANDMARK[it.id], 'and it must be that landmark’s tree');
+    game.input.handleEvent('keyup', { code: 'KeyE' });
+  });
+
+  test('VI4 · an open conversation stops the world but not the scene clock', () => {
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    const treeId = DIALOGUE_TREES[0].id;
+    assert.ok(game.conversation.start(treeId).ok, 'the scene must open');
+    const stepsBefore = game.steps;
+    const playerBefore = { ...game.player.pos };
+    game.input.handleEvent('keydown', { code: 'KeyW' });
+    step(game, 30);
+    assert.equal(game.steps, stepsBefore, 'the simulation must not advance during a scene');
+    assert.close(game.player.pos.x, playerBefore.x, 1e-9, 'and the player must not walk off mid-line');
+    assert.close(game.player.pos.z, playerBefore.z, 1e-9, 'in any direction');
+    assert.gt(game.conversation.stats.linesShown, 0, 'but the scene itself must keep running');
+    game.input.handleEvent('keyup', { code: 'KeyW' });
+  });
+
+  test('VI5 · each line is published as a subtitle with a reading time', () => {
+    const { game, bus } = bootGame();
+    const subs = [];
+    bus.on(Events.SUBTITLE, (p) => subs.push(p));
+    enrich(game.missions.state);
+    game.conversation.start(DIALOGUE_TREES[0].id);
+    assert.gt(subs.length, 0, 'opening a scene must publish its first line');
+    const first = subs[0];
+    assert.ok(first.text && first.text.length > 0, 'the line must have text');
+    assert.gt(first.ms, 0, 'and a reading time');
+    assert.equal(first.index, 0, 'numbered from the first line');
+    assert.equal(first.total, subs[0].total, 'with the total announced');
+    assert.ok(first.speaker !== undefined, 'and a speaker, so the HUD can name them');
+  });
+
+  test('VI6 · pressing through advances one line at a time', () => {
+    // A scene that can be skipped instantly is a scene whose writing was never read.
+    const { game, bus } = bootGame();
+    const subs = [];
+    bus.on(Events.SUBTITLE, (p) => subs.push(p));
+    enrich(game.missions.state);
+    game.conversation.start(DIALOGUE_TREES[0].id);
+    const view = game.conversation.view();
+    if (view.lineCount > 1) {
+      const shown = subs.length;
+      game.conversation.skipOrAdvance();
+      assert.equal(subs.length, shown + 1, 'one press shows exactly one more line');
+      assert.equal(game.conversation.active, true, 'and the scene is still open');
+    }
+    assert.ok(view.linesDone === false || view.lineCount === 1, 'lines are not all shown at once');
+  });
+
+  test('VI7 · a node offering choices cannot be advanced past by mashing', () => {
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    // Find a tree whose entry node has choices, which most of them do.
+    const tree = DIALOGUE_TREES.find((t) => (t.nodes[t.entry].choices ?? []).length > 0);
+    assert.ok(tree, 'a tree with a choice at its entry is needed');
+    game.conversation.start(tree.id);
+    for (let i = 0; i < 20; i++) {
+      game.conversation.update(0.5);
+      if (game.conversation.readyForInput) break;
+    }
+    const res = game.conversation.skipOrAdvance();
+    assert.equal(res.ok, false, 'mashing must not skip the choice');
+    assert.equal(res.reason, 'awaiting-choice', 'and must say why');
+    assert.equal(game.conversation.active, true, 'the scene stays open');
+  });
+
+  test('VI8 · an available choice moves the scene and is recorded', () => {
+    const { game } = bootGame();
+    const state = enrich(game.missions.state);
+    const tree = DIALOGUE_TREES.find((t) => (t.nodes[t.entry].choices ?? []).length > 0);
+    game.conversation.start(tree.id);
+    for (let i = 0; i < 20; i++) { game.conversation.update(0.5); if (game.conversation.readyForInput) break; }
+    const before = state.choicesTaken.size;
+    const res = game.conversation.choose(0);
+    assert.ok(res.ok, `the first choice must be takeable: ${res.reason}`);
+    assert.gt(state.choicesTaken.size, before, 'and must be recorded in the story state');
+    assert.equal(game.conversation.stats.choices, 1, 'and counted');
+  });
+
+  test('VI9 · a choice taken before its beat is refused, not swallowed', () => {
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    const tree = DIALOGUE_TREES.find((t) => (t.nodes[t.entry].choices ?? []).length > 0);
+    game.conversation.start(tree.id);
+    // No update() calls: the lines have not run and the beat has not elapsed.
+    const res = game.conversation.choose(0);
+    assert.equal(res.ok, false, 'a choice taken before the node is ready must be refused');
+    assert.equal(res.reason, 'not-ready', 'with a reason the UI can act on');
+  });
+
+  test('VI10 · a locked choice is refused and applies nothing', () => {
+    const { game } = bootGame();
+    // A bare state this time: the gated branch must actually be gated.
+    const tree = DIALOGUE_TREES.find((t) =>
+      (t.nodes[t.entry].choices ?? []).some((c) => c.requires?.clues?.length));
+    assert.ok(tree, 'a tree with a clue-gated entry choice is needed');
+    const gate = tree.nodes[tree.entry].choices.findIndex((c) => c.requires?.clues?.length);
+    const started = game.conversation.start(tree.id);
+    assert.ok(started.ok, `the scene must open even with a gated choice: ${started.reason}`);
+    for (let i = 0; i < 20; i++) { game.conversation.update(0.5); if (game.conversation.readyForInput) break; }
+    const view = game.conversation.view();
+    assert.equal(view.choices[gate].available, false, 'the gated choice must show as locked');
+    assert.ok(view.choices[gate].lockedReason, 'and must say what unlocks it');
+    const res = game.conversation.choose(gate);
+    assert.equal(res.ok, false, 'a locked choice must be refused');
+    assert.equal(res.reason, 'locked');
+  });
+
+  test('VI11 · finishing a scene tells the mission system exactly once', () => {
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    const notified = [];
+    const real = game.missions.notify.bind(game.missions);
+    game.missions.notify = (e) => { if (e?.kind === 'dialogue') notified.push(e.id); return real(e); };
+    const treeId = DIALOGUE_TREES[0].id;
+    game.conversation.start(treeId);
+    playThrough(game);
+    assert.equal(game.conversation.active, false, 'the scene must have ended');
+    assert.deepEqual(notified, [treeId], `expected exactly one notification, got ${notified.length}`);
+    assert.equal(game.conversation.stats.completed, 1, 'and counted as completed');
+  });
+
+  test('VI12 · walking away mid-scene does not complete the objective', () => {
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    const notified = [];
+    const real = game.missions.notify.bind(game.missions);
+    game.missions.notify = (e) => { if (e?.kind === 'dialogue') notified.push(e.id); return real(e); };
+    game.conversation.start(DIALOGUE_TREES[0].id);
+    const res = game.conversation.leave();
+    assert.ok(res.ok, 'leaving must always be allowed');
+    assert.equal(res.reason, 'left');
+    assert.equal(notified.length, 0, 'an abandoned scene must not count as finished');
+    assert.equal(game.conversation.stats.left, 1, 'and is recorded as left');
+    assert.equal(game.conversation.active, false, 'the scene is closed');
+  });
+
+  test('VI13 · all fourteen trees can be opened and finished through the runtime', () => {
+    // The strongest available claim: not that the trees are valid - run-deep proves
+    // that - but that a player driving the real Conversation driver can complete
+    // every one of them. This is the test that would have caught the unwired walker.
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    const completed = [];
+    const refused = [];
+    for (const tree of DIALOGUE_TREES) {
+      const res = game.conversation.start(tree.id);
+      if (!res.ok) { refused.push(`${tree.id}:${res.reason}`); continue; }
+      const turns = playThrough(game, 600);
+      if (game.conversation.active) refused.push(`${tree.id}:stuck-after-${turns}`);
+      else completed.push(tree.id);
+    }
+    assert.deepEqual(refused, [], `trees that could not be completed: ${refused.join(', ')}`);
+    assert.equal(completed.length, DIALOGUE_TREES.length, 'every tree must be completable');
+    assert.equal(game.conversation.stats.completed, DIALOGUE_TREES.length, 'and each counted once');
+  });
+
+  test('VI14 · a scene the player cannot finish is refused before it opens', () => {
+    const { game } = bootGame();
+    // Bare state: no clues, no flags. A tree gated on a clue cannot be finished, so
+    // opening it would trap the player in a conversation with no exit.
+    const gated = DIALOGUE_TREES.find((t) => {
+      const w = new DialogueWalker({ bus: new EventBus() });
+      return w.begin(t.id, game.missions.state).reason === 'trapped';
+    });
+    if (!gated) return;   // no tree is currently gated from a cold start
+    const res = game.conversation.start(gated.id);
+    assert.equal(res.ok, false, 'a trapped scene must be refused');
+    assert.equal(res.reason, 'trapped', 'and must say it is trapped, not unknown');
+    assert.equal(game.conversation.active, false, 'and must not open');
+  });
+
+  test('VI15 · examining a landmark completes the objective that asked for it', () => {
+    const { game } = bootGame();
+    const mission = MISSIONS.find((m) =>
+      m.objectives.some((o) => o.type === 'examine'));
+    assert.ok(mission, 'a mission with an examine objective is needed');
+    const objective = mission.objectives.find((o) => o.type === 'examine');
+    game.missions.startChapter(mission.chapter);
+    game.missions.startMission(mission.id);
+    game._actOn({ id: objective.target, kind: 'examine' });
+    assert.ok(game.missions.state.isObjectiveDone(mission.id, objective.id),
+      `examining ${objective.target} must complete ${mission.id}/${objective.id}`);
+  });
+
+  test('VI16 · a clue landmark grants the clue bound to it in the content', () => {
+    const { game } = bootGame();
+    const clue = CLUES[0];
+    game._actOn({ id: clue.landmark, kind: 'clue' });
+    assert.ok(game.missions.state.hasClue(clue.id),
+      `${clue.landmark} must grant ${clue.id}`);
+    // And it must not grant a different clue for the same landmark.
+    const others = CLUES.filter((c) => c.id !== clue.id);
+    const wronglyGranted = others.filter((c) => game.missions.state.hasClue(c.id));
+    assert.equal(wronglyGranted.length, 0,
+      `a clue landmark granted unrelated clues: ${wronglyGranted.map((c) => c.id).join(', ')}`);
+  });
+
+  test('VI17 · a clue-flavored landmark with no clue behind it is answered, not raised', () => {
+    // Sixteen landmarks offer a clue interaction; ten clues exist. My first version of
+    // this test demanded one clue per landmark and failed, and the failure was worth
+    // keeping: the runtime was emitting an ERROR event for each of the six unbound
+    // landmarks, so a player inspecting a hearth or a roadside stele would have seen a
+    // developer error on screen. The content was fine. The handler was not. Now an
+    // unbound landmark is examined: the player asks, the game says nothing is there.
+    const bound = new Set(CLUES.map((c) => c.landmark));
+    const unbound = LANDMARKS.filter((l) => l.interact === 'clue' && !bound.has(l.id));
+    assert.equal(unbound.length, 6, 'the content has six clue-flavored landmarks with no clue');
+
+    const { game, bus } = bootGame();
+    const errors = [];
+    const notified = [];
+    bus.on(Events.ERROR, (e) => errors.push(e));
+    const real = game.missions.notify.bind(game.missions);
+    game.missions.notify = (e) => { notified.push(e); return real(e); };
+
+    for (const lm of unbound) {
+      const cluesBefore = game.missions.state.clues.length;
+      game._actOn({ id: lm.id, kind: lm.interact });
+      assert.equal(game.missions.state.clues.length, cluesBefore,
+        `${lm.id} must not invent a clue`);
+      assert.ok(notified.some((e) => e.kind === 'examine' && e.id === lm.id),
+        `${lm.id} must still notify an examine, so an objective can count it`);
+    }
+    assert.deepEqual(errors.map((e) => e.message), [],
+      'inspecting an ordinary landmark must never surface an error to the player');
+  });
+
+  test('VI17b · the walker’s batch subtitles are muted while the driver times them', () => {
+    // The walker publishes every line of a node the moment it enters it. The driver
+    // publishes them one at a time. Left alone the HUD would be handed the whole
+    // scene instantly and then the same scene again, line by line.
+    const { game, bus } = bootGame();
+    const subs = [];
+    bus.on(Events.SUBTITLE, (p) => subs.push(p));
+    enrich(game.missions.state);
+    const tree = DIALOGUE_TREES[0];
+    const node = tree.nodes[tree.entry];
+    const lineCount = (node.lines ?? []).length;
+    game.conversation.start(tree.id);
+    assert.equal(subs.length, Math.min(1, lineCount),
+      'opening a scene publishes the first line only, never the whole node');
+    for (const s of subs) {
+      assert.equal(s.index !== undefined, true, 'every subtitle must be positioned');
+      assert.equal(s.source, 'dialogue', 'and attributed');
+    }
+    // Scene events that are not subtitles must still reach the HUD.
+    assert.ok(game.conversation.stats.started >= 1, 'the scene opened');
+  });
+
+  test('VI18 · a search landmark notifies a search, which is what the objective counts', () => {
+    const { game } = bootGame();
+    const notified = [];
+    const real = game.missions.notify.bind(game.missions);
+    game.missions.notify = (e) => { notified.push(e); return real(e); };
+    const lm = LANDMARKS.find((l) => l.interact === 'search');
+    game._actOn({ id: lm.id, kind: 'search' });
+    assert.ok(notified.some((e) => e.kind === 'search' && e.id === lm.id),
+      'a search event must be sent for the landmark');
+    assert.ok(notified.some((e) => e.kind === 'landmark' && e.id === lm.id),
+      'and a landmark event, so GOTO objectives also see the arrival');
+  });
+
+  test('VI19 · the prompt names the right verb for each interact kind', () => {
+    const { game, bus } = bootGame();
+    const prompts = [];
+    bus.on(Events.PROMPT, (p) => prompts.push(p));
+    const lm = LANDMARKS.find((l) => l.interact === 'dialogue' && l.region === game.regionId)
+      ?? LANDMARKS.find((l) => l.interact === 'examine');
+    if (lm.region !== game.regionId) game.setRegion(lm.region);
+    const it = game.space.interactables.find((i) => i.id === lm.id);
+    if (!it) return;
+    game.player.setPosition(it.x, game.space.heightAt(it.x, it.z), it.z);
+    step(game, 2);
+    const last = prompts[prompts.length - 1];
+    assert.ok(last, 'a prompt must be published at the landmark');
+    assert.ok(last.action && last.action.length > 0, 'with an action verb');
+    assert.ok(last.label && last.label.length > 0, 'and the landmark’s name');
+    game.setLanguage('en');
+    game.prompt = null;
+    step(game, 2);
+    const en = prompts[prompts.length - 1];
+    assert.ok(en, 'the prompt must be republished after a language change');
+    assert.notEqual(en.action, last.action, 'and the verb must actually change');
+  });
+
+  test('VI20 · Escape leaves a conversation instead of opening the pause menu', () => {
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    game.conversation.start(DIALOGUE_TREES[0].id);
+    assert.equal(game.conversation.active, true);
+    game.input.handleEvent('keydown', { code: 'Escape' });
+    game.input.handleEvent('keyup', { code: 'Escape' });
+    step(game, 1);
+    assert.equal(game.conversation.active, false, 'the scene must close');
+    assert.equal(game.paused, false, 'and the pause menu must not open over it');
+  });
+
+  test('VI21 · the driver is reusable: a second scene opens after the first ends', () => {
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    game.conversation.start(DIALOGUE_TREES[0].id);
+    playThrough(game);
+    assert.equal(game.conversation.active, false, 'the first scene ended');
+    const res = game.conversation.start(DIALOGUE_TREES[1].id);
+    assert.ok(res.ok, `a second scene must open: ${res.reason}`);
+    assert.equal(game.conversation.treeId, DIALOGUE_TREES[1].id);
+  });
+
+  test('VI22 · opening a scene while one is open is refused, not nested', () => {
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    game.conversation.start(DIALOGUE_TREES[0].id);
+    const res = game.conversation.start(DIALOGUE_TREES[1].id);
+    assert.equal(res.ok, false, 'two scenes at once must be refused');
+    assert.equal(res.reason, 'busy');
+    assert.equal(game.conversation.treeId, DIALOGUE_TREES[0].id, 'and the first is untouched');
+  });
+
+  test('VI22b · muteEvents forwards everything it was not asked to swallow', () => {
+    const bus = new EventBus();
+    const seen = [];
+    bus.on(Events.SUBTITLE, () => seen.push('subtitle'));
+    bus.on(Events.DIALOGUE_START, () => seen.push('start'));
+    const muted = muteEvents(bus, [Events.SUBTITLE]);
+    muted.emit(Events.SUBTITLE, { text: 'x' });
+    muted.emit(Events.DIALOGUE_START, { treeId: 't' });
+    assert.deepEqual(seen, ['start'], 'only the named events are dropped');
+    assert.equal(muted.raw, bus, 'and the underlying bus stays reachable');
+  });
+
+  test('VI22c · choices are published once, after the beat, with their locks intact', () => {
+    // The HUD draws from this event and never polls the graph, so the event has to
+    // be right: once per node, not once per frame, and not before the beat ends or a
+    // player mashing through lines selects the first reply without seeing it.
+    const { game, bus } = bootGame();
+    const published = [];
+    bus.on(Events.DIALOGUE_CHOICES, (p) => published.push(p));
+    enrich(game.missions.state);
+    const tree = DIALOGUE_TREES.find((t2) => (t2.nodes[t2.entry].choices ?? []).length > 1);
+    assert.ok(tree, 'a tree with several entry choices is needed');
+    game.conversation.start(tree.id);
+    assert.equal(published.length, 0, 'nothing is offered while the lines are still running');
+    for (let i = 0; i < 40 && published.length === 0; i++) game.conversation.update(0.2);
+    assert.equal(published.length, 1, 'and exactly one offer once the beat has elapsed');
+    for (let i = 0; i < 10; i++) game.conversation.update(0.2);
+    assert.equal(published.length, 1, 'further frames must not republish the same node');
+    const payload = published[0];
+    assert.equal(payload.treeId, tree.id);
+    assert.ok(payload.speaker, 'the speaker is named, so the panel can show who is talking');
+    assert.equal(payload.choices.length, (tree.nodes[tree.entry].choices ?? []).length,
+      'every choice on the node is offered');
+    for (const c of payload.choices) {
+      assert.ok(c.text && c.text.length > 0, 'each choice has readable text');
+      assert.equal(typeof c.available, 'boolean', 'and says whether it can be taken');
+      assert.equal(Number.isInteger(c.index), true, 'and is numbered');
+    }
+  });
+
+  test('VI22d · a node with no choices still publishes, so the buttons come away', () => {
+    // If only nodes with choices published, a panel of buttons would survive into the
+    // next node and the player would be answering a question nobody asked.
+    const { game, bus } = bootGame();
+    const published = [];
+    bus.on(Events.DIALOGUE_CHOICES, (p) => published.push(p));
+    enrich(game.missions.state);
+    const tree = DIALOGUE_TREES.find((t2) => (t2.nodes[t2.entry].choices ?? []).length === 0);
+    if (!tree) return;
+    game.conversation.start(tree.id);
+    for (let i = 0; i < 40 && published.length === 0; i++) game.conversation.update(0.2);
+    assert.equal(published.length, 1, 'the node must publish');
+    assert.deepEqual(published[0].choices, [], 'with an empty list');
+  });
+
+  test('VI22e · every tree publishes choices the player can actually take', () => {
+    // Across all fourteen trees, walking each to the end: no node may offer only
+    // locked choices, which would strand the player mid-conversation with nothing
+    // to press and no way out but walking away.
+    const { game } = bootGame();
+    enrich(game.missions.state);
+    const stranded = [];
+    for (const tree of DIALOGUE_TREES) {
+      if (!game.conversation.start(tree.id).ok) continue;
+      let guard = 0;
+      while (game.conversation.active && guard++ < 600) {
+        game.conversation.update(0.4);
+        if (!game.conversation.readyForInput) continue;
+        const v = game.conversation.view();
+        const choices = v?.choices ?? [];
+        if (choices.length && !choices.some((c) => c.available)) {
+          stranded.push(`${tree.id}@${v.nodeId}`);
+          break;
+        }
+        if (choices.length) game.conversation.choose(choices.find((c) => c.available).index);
+        else game.conversation.skipOrAdvance();
+      }
+    }
+    assert.deepEqual(stranded, [], `nodes offering only locked choices: ${stranded.join(', ')}`);
+  });
+
+  test('VI23 · a language change re-localizes the line on screen', () => {
+    const { game, bus } = bootGame();
+    const subs = [];
+    bus.on(Events.SUBTITLE, (p) => subs.push(p));
+    enrich(game.missions.state);
+    game.conversation.start(DIALOGUE_TREES[0].id);
+    const arLine = subs[subs.length - 1].text;
+    game.setLanguage('en');
+    const enLine = subs[subs.length - 1].text;
+    assert.notEqual(enLine, arLine, 'the same line must be re-published in the new language');
+    assert.equal(game.walker.language, 'en', 'and the walker must follow');
+  });
+});
+
+runAndExit();
