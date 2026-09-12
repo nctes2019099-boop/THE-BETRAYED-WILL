@@ -234,6 +234,16 @@ export class InputManager {
       pointerlockchange: () => this.handleEvent('pointerlockchange', {}),
     };
     for (const [type, fn] of Object.entries(this._handlers)) target.addEventListener(type, fn);
+    // `visibilitychange` is dispatched on a document, never on a window. With a window
+    // target the listener above never runs, and keys held when the tab was hidden stay
+    // latched on return - the character sprints forever. Register it on the window's
+    // document as well. A document target has no `.document`, so this cannot double-fire.
+    this._docTarget = null;
+    const doc = target.document;
+    if (doc && doc !== target && typeof doc.addEventListener === 'function') {
+      doc.addEventListener('visibilitychange', this._handlers.visibilitychange);
+      this._docTarget = doc;
+    }
     this.attached = true;
     return true;
   }
@@ -242,6 +252,10 @@ export class InputManager {
     if (!this.attached || !this.target) return false;
     for (const [type, fn] of Object.entries(this._handlers ?? {})) {
       this.target.removeEventListener?.(type, fn);
+    }
+    if (this._docTarget) {
+      this._docTarget.removeEventListener?.('visibilitychange', this._handlers?.visibilitychange);
+      this._docTarget = null;
     }
     this._handlers = null;
     this.attached = false;
@@ -381,6 +395,27 @@ export class InputManager {
    * one lands in `levelHeld` - the set `isActionDown` also reads - and an edge one
    * queues a press. Without that split a touch block button would never block.
    */
+  /**
+   * A one-shot press from something that is not a key: a touch button, a tutorial
+   * demonstrating a control, a debug hook.
+   *
+   * Only edge and UI actions can be pressed this way. A level action - sprint, block,
+   * aim, ledge - is refused rather than latched, because a level with nothing to
+   * release it is a stuck key: the character sprints until the page is reloaded and no
+   * keyup is ever coming. Callers that mean to hold one use setTouchAction().
+   *
+   * @param {string} action
+   * @param {string} [source]
+   * @returns {boolean} whether a press was queued
+   */
+  pressAction(action, source = InputSource.TOUCH) {
+    if (!EDGE_ACTIONS.includes(action) && !UI_ACTIONS.includes(action)) return false;
+    this.lastSource = source;
+    const queued = this._queueEdge(action);
+    if (queued) this.stats.presses++;
+    return queued;
+  }
+
   setTouchAction(action, held) {
     if (!EDGE_ACTIONS.includes(action) && !LEVEL_ACTIONS.includes(action) && !UI_ACTIONS.includes(action)) {
       return false;

@@ -106,6 +106,7 @@ export class Game {
     weather = 'clear',
     storage = undefined,
     rendererFactory = null,
+    inputTarget = undefined,
   } = {}) {
     this.bus = bus;
     this.canvas = canvas;
@@ -137,6 +138,12 @@ export class Game {
     };
 
     this._storageOpt = storage;
+    /**
+     * What the InputManager attaches to. `undefined` means "choose correctly": a
+     * global window in a browser, the canvas headlessly. An explicit `null` means
+     * "attach to nothing", which is what a caller driving handleEvent() by hand wants.
+     */
+    this._inputTarget = inputTarget;
     this._noiseSub = null;
     /**
      * Injected so the loop can be run headless.
@@ -215,8 +222,21 @@ export class Game {
     }
     this.save.attachAutosave();
 
+    // Keyboard events are delivered to whatever has focus, and a <canvas> is not
+    // focusable unless it carries a tabindex and something calls focus() on it. This
+    // file attached to the canvas and index.html does neither, so the game rendered,
+    // the mouse still turned the camera - mouse events target the element under the
+    // cursor, not the focused one - and not one key ever arrived. The character could
+    // not walk. Every suite passed regardless, because they all call handleEvent()
+    // directly instead of dispatching at a target, which tests the InputManager and
+    // never tests where it was attached.
+    const globalTarget = typeof window !== 'undefined' && typeof window?.addEventListener === 'function'
+      ? window : null;
+    const inputTarget = this._inputTarget === undefined
+      ? (globalTarget ?? this.canvas)
+      : this._inputTarget;
     this.input = new InputManager({
-      target: this.canvas,
+      target: inputTarget,
       bus: this.bus,
       gamepad: true,
       gamepadProvider: gamepadPoller(),

@@ -21,6 +21,7 @@
  */
 
 import { describe, test, assert, runAndExit, measure } from './harness.mjs';
+import { readFileSync } from 'node:fs';
 import { EventBus, Events } from '../src/core/bus.js';
 import { CAM, MOVE, PERF, SAVE, STEALTH } from '../src/core/constants.js';
 import { Vec3 } from '../src/core/math.js';
@@ -1041,6 +1042,300 @@ describe('runtime — conversation and interaction', () => {
     const enLine = subs[subs.length - 1].text;
     assert.notEqual(enLine, arLine, 'the same line must be re-published in the new language');
     assert.equal(game.walker.language, 'en', 'and the walker must follow');
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * VII — input attachment.
+ *
+ * The character did not move in the browser. Not a movement bug: the movement
+ * system, the input manager and the frame loop were each correct and each covered.
+ * main.js attached the InputManager to the <canvas>, a canvas receives no key events
+ * unless it is focusable and focused, and index.html gives it no tabindex and never
+ * calls focus(). The game rendered, the mouse still turned the camera - mouse events
+ * go to the element under the cursor, not the focused one - and not one key arrived.
+ *
+ * Every suite passed anyway, because every suite calls input.handleEvent() directly.
+ * That tests what the InputManager does with an event and never tests whether an
+ * event can reach it. This group dispatches at the attached target instead, which is
+ * the only form of this test that can fail for the right reason.
+ * ---------------------------------------------------------------------- */
+
+/** An event target that records listeners and can dispatch at them, like a DOM node. */
+class FakeEventTarget {
+  constructor(name = 'target', doc = null) {
+    this.name = name;
+    this.document = doc;
+    this.listeners = new Map();
+  }
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(fn);
+  }
+  removeEventListener(type, fn) {
+    const list = this.listeners.get(type);
+    if (!list) return;
+    const i = list.indexOf(fn);
+    if (i >= 0) list.splice(i, 1);
+  }
+  has(type) { return (this.listeners.get(type) ?? []).length > 0; }
+  /** Returns how many listeners ran, so a test can tell "no listener" from "no effect". */
+  dispatch(type, ev = {}) {
+    const list = this.listeners.get(type) ?? [];
+    for (const fn of list) fn(ev);
+    return list.length;
+  }
+}
+
+function windowLike() {
+  const doc = new FakeEventTarget('document');
+  return { win: new FakeEventTarget('window', doc), doc };
+}
+
+describe('runtime — input attachment', () => {
+  test('VII1 · a key dispatched at the attached target walks the character', () => {
+    const { win } = windowLike();
+    const { game } = bootGame({ inputTarget: win });
+    assert.equal(game.input.attached, true, 'input must be attached');
+    assert.equal(game.input.target, win, 'to the target it was given');
+    assert.ok(win.has('keydown'), 'with a keydown listener registered on it');
+    assert.ok(win.has('keyup'), 'and a keyup listener');
+
+    const before = { ...game.player.pos };
+    assert.equal(win.dispatch('keydown', { code: 'KeyW' }), 1, 'the dispatch must reach a listener');
+    step(game, 60);
+    const moved = Math.hypot(game.player.pos.x - before.x, game.player.pos.z - before.z);
+    assert.gt(moved, 0.5, `holding W for one second moved the character ${moved.toFixed(3)}m`);
+
+    const atRelease = { ...game.player.pos };
+    win.dispatch('keyup', { code: 'KeyW' });
+    step(game, 30);
+    const drift = Math.hypot(game.player.pos.x - atRelease.x, game.player.pos.z - atRelease.z);
+    assert.lt(drift, 0.4, `releasing the key must stop them, drifted ${drift.toFixed(3)}m`);
+  });
+
+  test('VII2 · every movement direction is reachable through the attached target', () => {
+    // One direction working would not have caught this either: the reported symptom is
+    // "the character does not move", and a suite that only checks W cannot tell a
+    // broken binding for A from a broken attachment.
+    const { win } = windowLike();
+    const { game } = bootGame({ inputTarget: win });
+    const dirs = [
+      ['KeyW', 'forward'], ['KeyS', 'back'], ['KeyA', 'left'], ['KeyD', 'right'],
+    ];
+    for (const [code, name] of dirs) {
+      const before = { ...game.player.pos };
+      win.dispatch('keydown', { code });
+      step(game, 30);
+      win.dispatch('keyup', { code });
+      const moved = Math.hypot(game.player.pos.x - before.x, game.player.pos.z - before.z);
+      assert.gt(moved, 0.15, `${name} (${code}) moved ${moved.toFixed(3)}m in half a second`);
+      step(game, 10);
+    }
+  });
+
+  test('VII3 · a hidden tab releases held keys through the document listener', () => {
+    const { win, doc } = windowLike();
+    const { game } = bootGame({ inputTarget: win });
+    assert.ok(doc.has('visibilitychange'),
+      'visibilitychange fires on a document, never on a window, so it must be registered there');
+    win.dispatch('keydown', { code: 'KeyW' });
+    assert.equal(game.input.isDown('KeyW'), true, 'the key is held');
+    doc.dispatch('visibilitychange', { hidden: true });
+    assert.equal(game.input.isDown('KeyW'), false,
+      'a player who alt-tabs out holding W must not return to a character still running');
+  });
+
+  test('VII4 · with a browser global present, input attaches to it and not to the canvas', () => {
+    // This is the regression guard for the actual defect. The canvas fallback is right
+    // headlessly and wrong in a browser, and only a test that knows both exist can say
+    // which one was chosen.
+    const { win } = windowLike();
+    const canvas = new FakeEventTarget('canvas');
+    const previous = globalThis.window;
+    try {
+      globalThis.window = win;
+      const game = new Game({
+        canvas, bus: new EventBus(), seed: 'mesopotamia', language: 'ar',
+        storage: new MemoryStorage(), rendererFactory: stubRenderer,
+      });
+      game.boot();
+      assert.equal(game.input.target, win, 'keyboard must attach to the window');
+      assert.equal(canvas.has('keydown'), false,
+        'a canvas receives no key events unless it is focusable and focused, and index.html does neither');
+    } finally {
+      if (previous === undefined) delete globalThis.window;
+      else globalThis.window = previous;
+    }
+  });
+
+  test('VII5 · headlessly, with no window, it falls back to the canvas', () => {
+    // The fallback is what lets every other suite keep working, so it has to be
+    // asserted rather than assumed: removing it would silently detach input in node.
+    assert.equal(typeof globalThis.window, 'undefined', 'node has no window');
+    const canvas = new FakeEventTarget('canvas');
+    const game = new Game({
+      canvas, bus: new EventBus(), seed: 'mesopotamia',
+      storage: new MemoryStorage(), rendererFactory: stubRenderer,
+    });
+    game.boot();
+    assert.equal(game.input.target, canvas, 'the canvas is the headless target');
+    assert.equal(game.input.attached, true);
+  });
+
+  test('VII6 · an explicit null target attaches nothing and stays drivable by hand', () => {
+    const { game } = bootGame({ inputTarget: null });
+    assert.equal(game.input.attached, false, 'nothing is attached');
+    const before = { ...game.player.pos };
+    game.input.handleEvent('keydown', { code: 'KeyW' });
+    step(game, 30);
+    const moved = Math.hypot(game.player.pos.x - before.x, game.player.pos.z - before.z);
+    assert.gt(moved, 0.15, 'handleEvent must still work for a caller driving it directly');
+  });
+
+  test('VII7 · detaching removes every listener, including the document one', () => {
+    const { win, doc } = windowLike();
+    const { game } = bootGame({ inputTarget: win });
+    assert.ok(win.has('keydown') && doc.has('visibilitychange'));
+    assert.ok(game.input.detach(), 'detach must report success');
+    assert.equal(win.has('keydown'), false, 'the window listeners are gone');
+    assert.equal(doc.has('visibilitychange'), false, 'and so is the document one');
+    assert.equal(game.input.attached, false);
+  });
+
+  test('VII8 · the sprint and crouch keys reach the character through the target', () => {
+    // Interaction is not only walking. If the attachment were fixed but a binding were
+    // missing, the player would move and still report the game as unresponsive.
+    const { win } = windowLike();
+    const { game } = bootGame({ inputTarget: win });
+    win.dispatch('keydown', { code: 'ShiftLeft' });
+    win.dispatch('keydown', { code: 'KeyW' });
+    step(game, 20);
+    const intent = game.input.sample(1 / 60);
+    assert.equal(intent.sprint, true, 'shift must read as sprint');
+    win.dispatch('keyup', { code: 'ShiftLeft' });
+    win.dispatch('keydown', { code: 'KeyC' });
+    const crouched = game.input.sample(1 / 60);
+    assert.equal(crouched.crouch, true, 'C must read as crouch');
+    win.dispatch('keyup', { code: 'KeyW' });
+    win.dispatch('keyup', { code: 'KeyC' });
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * VIII — the page and the runtime agree.
+ *
+ * Three defects in this build were the same shape: a layer that worked, tested in
+ * isolation, and a seam to the browser that did not exist. Dialogue was never
+ * wired. Cinematics emitted start and end in the same call. Input was attached to a
+ * canvas that receives no key events, and index.html called input.pressAction(), a
+ * method InputManager never had - so every tap of Attack, Jump, Interact and Dodge
+ * on a phone threw a TypeError while the suites that test InputManager passed.
+ *
+ * A unit test cannot see this, because a unit test calls the method it means to
+ * call. So this group reads index.html as text, extracts every method it invokes on
+ * the game, and checks each one against a booted runtime. It is a contract test
+ * between two files that are never imported together.
+ * ---------------------------------------------------------------------- */
+
+const PAGE = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+
+/** Every `game.x.y(` and `game.x(` call in the page, optional chaining included. */
+function pageCallsOnGame(source) {
+  const nested = new Set();
+  const direct = new Set();
+  const reNested = /game\??\.([A-Za-z_$][\w$]*)\??\.([A-Za-z_$][\w$]*)\s*\(/g;
+  const reDirect = /game\??\.([A-Za-z_$][\w$]*)\s*\(/g;
+  for (const m of source.matchAll(reNested)) nested.add(`${m[1]}.${m[2]}`);
+  for (const m of source.matchAll(reDirect)) {
+    // Skip anything already captured as the first half of a nested call.
+    if (![...nested].some((n) => n.startsWith(`${m[1]}.`))) direct.add(m[1]);
+  }
+  return { nested: [...nested], direct: [...direct] };
+}
+
+describe('runtime — the page/runtime contract', () => {
+  test('VIII1 · every method index.html calls on the game exists on a booted game', () => {
+    const { nested, direct } = pageCallsOnGame(PAGE);
+    assert.gt(nested.length + direct.length, 10,
+      'the page must actually call into the runtime, or this test proves nothing');
+
+    const { game } = bootGame();
+    const missing = [];
+    for (const path of nested) {
+      const [owner, method] = path.split('.');
+      if (game[owner] == null) { missing.push(`${path} — game.${owner} is ${game[owner]}`); continue; }
+      if (typeof game[owner][method] !== 'function') {
+        missing.push(`${path} — game.${owner}.${method} is ${typeof game[owner][method]}`);
+      }
+    }
+    for (const method of direct) {
+      if (typeof game[method] !== 'function') {
+        missing.push(`${method} — game.${method} is ${typeof game[method]}`);
+      }
+    }
+    assert.deepEqual(missing, [],
+      `index.html calls methods the runtime does not have:\n  ${missing.join('\n  ')}`);
+  });
+
+  test('VIII2 · the touch buttons only press actions the input manager accepts', () => {
+    // The page declares its touch buttons in markup and dispatches them by name. A
+    // name the InputManager does not know is a button that silently does nothing, and
+    // it is invisible on desktop where the buttons are not rendered at all.
+    const acts = [...PAGE.matchAll(/data-act="([A-Za-z]+)"/g)].map((m) => m[1]);
+    assert.gt(acts.length, 4, 'the touch layer must declare its buttons');
+    const { game } = bootGame();
+    const held = new Set(['block', 'sprint', 'crouch']);
+    const bad = [];
+    for (const act of acts) {
+      if (act === 'pause') {
+        // Handled in the page, never reaching the input manager.
+        continue;
+      }
+      const ok = held.has(act)
+        ? game.input.setTouchAction(act, true)
+        : game.input.pressAction(act);
+      if (!ok) bad.push(act);
+    }
+    assert.deepEqual(bad, [], `touch buttons the input manager refused: ${bad.join(', ')}`);
+  });
+
+  test('VIII3 · a tapped touch button produces one press, and only one', () => {
+    // A tap that queues two edges double-fires: one tap swings twice, or skips two
+    // lines of dialogue. A tap that queues none is the button doing nothing.
+    const { game } = bootGame();
+    assert.equal(game.input.pressAction('interact'), true, 'the press must be accepted');
+    assert.equal(game.input.takeAction('interact'), true, 'and consumed by the loop');
+    assert.equal(game.input.takeAction('interact'), false, 'exactly once');
+
+    assert.equal(game.input.pressAction('attackLight'), true);
+    const intent = game.input.sample(1 / 60);
+    assert.equal(intent.attackLight, true, 'the intent must carry it');
+    assert.equal(game.input.sample(1 / 60).attackLight, false, 'and not carry it again next frame');
+  });
+
+  test('VIII4 · pressAction refuses a level action rather than latching it', () => {
+    // A level action pressed with nothing to release it is a stuck key: the character
+    // sprints until the page is reloaded, and no keyup is ever coming.
+    const { game } = bootGame();
+    assert.equal(game.input.pressAction('sprint'), false, 'sprint is a level action');
+    assert.equal(game.input.pressAction('block'), false, 'so is block');
+    assert.equal(game.input.isActionDown('sprint'), false, 'and nothing was latched');
+    assert.equal(game.input.pressAction('not-an-action'), false, 'unknown actions are refused');
+    // The held path still works, because that is what the page uses for these.
+    assert.equal(game.input.setTouchAction('sprint', true), true);
+    assert.equal(game.input.isActionDown('sprint'), true);
+    game.input.setTouchAction('sprint', false);
+    assert.equal(game.input.isActionDown('sprint'), false, 'and releases');
+  });
+
+  test('VIII5 · every Events name the page listens for is a real event', () => {
+    // The mirror image of VIII1: a typo in an event name is a listener that never
+    // fires, and nothing throws to say so.
+    const used = new Set([...PAGE.matchAll(/Events\.([A-Z_][A-Z0-9_]*)/g)].map((m) => m[1]));
+    assert.gt(used.size, 8, 'the page must subscribe to events');
+    const missing = [...used].filter((name) => !(name in Events));
+    assert.deepEqual(missing, [], `index.html listens for events that do not exist: ${missing.join(', ')}`);
   });
 });
 
