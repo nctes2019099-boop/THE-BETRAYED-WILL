@@ -1387,6 +1387,115 @@ describe('runtime — the page/runtime contract', () => {
     const missing = imports.filter((spec) => !existsSync(new URL(spec, PAGE_URL)));
     assert.deepEqual(missing, [], `imports that resolve to nothing: ${missing.join(', ')}`);
   });
+
+  test('VIII9 · no module-scope binding is read before it is declared', () => {
+    /**
+     * A `const` read before its declaration is not undefined, it is a ReferenceError -
+     * and in this page it happens during module evaluation, before boot() is ever
+     * called. The result is a title, a progress bar that never moves, and nothing in
+     * the way of a report, because the only thing that would have printed one is the
+     * script that just died.
+     *
+     * This found a real one: the audio wiring read `isTouch` at module scope, several
+     * hundred lines above where the touch handlers declared it. Every other check in
+     * this group passed, because the page is structurally fine and merely cannot run.
+     *
+     * The heuristic is indentation. This file writes its module-scope statements at
+     * column zero and everything nested inside something else is indented, so a
+     * column-zero line is a statement that runs at evaluation time and an indented one
+     * is a function body that runs later, when every binding already exists. That is a
+     * style assumption, but it is this file's own style, and the alternative - parsing
+     * JavaScript - is not available to a suite with no dependencies.
+     */
+    const body = PAGE.slice(PAGE.indexOf('<script type="module">'), PAGE.lastIndexOf('</script>'));
+
+    /** Strip what cannot contain a binding reference, so strings and comments do not lie. */
+    const code = (line) => line
+      .replace(/\/\/.*$/, ' ')
+      .replace(/'[^']*'/g, "''")
+      .replace(/"[^"]*"/g, '""')
+      .replace(/`[^`]*`/g, '``');
+    /** `$` and friends are regex metacharacters; an unescaped name matches everything. */
+    const quoted = (name) => name.replace(/[^\w]/g, (ch) => `\\${ch}`);
+
+    const declared = new Map();       // name -> first line index declaring it
+    const topLevel = [];              // {i, text} statements that run at evaluation time
+    let inBlockComment = false;
+    const lines = body.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i];
+      // A block comment may open at column zero and run for twenty lines. Reading it as
+      // code is how a prose word becomes a phantom binding reference.
+      if (inBlockComment) {
+        if (raw.includes('*/')) inBlockComment = false;
+        continue;
+      }
+      if (/^\s*\/\*/.test(raw)) {
+        if (!raw.includes('*/')) inBlockComment = true;
+        continue;
+      }
+      if (/^\s/.test(raw) || raw.trim() === '' || raw.trim().startsWith('*')) continue;
+      if (raw.startsWith('</') || raw.startsWith('<script')) continue;
+      const text = code(raw);
+      topLevel.push({ i, text });
+      const m = text.match(/^(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=/);
+      if (m && !declared.has(m[1])) declared.set(m[1], i);
+    }
+    assert.gt(declared.size, 10, 'the page must declare module-scope bindings, or this proves nothing');
+    assert.gt(topLevel.length, 40, 'the page must run statements at module scope');
+
+    const early = [];
+    for (const { i, text } of topLevel) {
+      for (const [name, at] of declared) {
+        if (i >= at) continue;
+        // A whole-word reference that is not a property of something else.
+        if (new RegExp(`(^|[^.\\w$])${quoted(name)}([^\\w$]|$)`).test(text)) {
+          early.push(`${name} read on line ${i} ("${text.trim().slice(0, 60)}"), declared on line ${at}`);
+        }
+      }
+    }
+    assert.deepEqual(early, [],
+      `bindings used before declaration, which is a ReferenceError at module scope:\n  ${early.join('\n  ')}`);
+  });
+
+  test('VIII10 · every localized string the page asks for exists in both languages', () => {
+    /**
+     * Arabic is the first-class language and English is not an afterthought, so a key
+     * present in one dictionary and missing from the other renders as the raw key on
+     * screen in exactly one of them - which is how it survives a playthrough in the
+     * language its author was reading.
+     */
+    const dict = (lang) => {
+      const start = PAGE.indexOf(`${lang}: {`, PAGE.indexOf('const STRINGS'));
+      assert.gt(start, 0, `no ${lang} dictionary`);
+      let depth = 0;
+      let end = start;
+      for (let i = PAGE.indexOf('{', start); i < PAGE.length; i++) {
+        if (PAGE[i] === '{') depth++;
+        else if (PAGE[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+      }
+      const block = PAGE.slice(start, end);
+      return new Set([...block.matchAll(/(?:^|[,{\s])'?([\w-]+)'?\s*:/g)].map((m) => m[1]));
+    };
+    const ar = dict('ar');
+    const en = dict('en');
+    assert.gt(ar.size, 40, 'the Arabic dictionary looks empty');
+    assert.gt(en.size, 40, 'the English dictionary looks empty');
+
+    // Keys the markup asks for, and keys the script asks for through t().
+    const wanted = new Set([
+      ...[...PAGE.matchAll(/data-i18n="([^"]+)"/g)].map((m) => m[1]),
+      ...[...PAGE.matchAll(/data-i18n-short="([^"]+)"/g)].map((m) => m[1]),
+      ...[...PAGE.matchAll(/\bt\('([\w-]+)'\)/g)].map((m) => m[1]),
+      ...[...PAGE.matchAll(/setAttribute\('data-i18n',\s*'([\w-]+)'\)/g)].map((m) => m[1]),
+    ]);
+    assert.gt(wanted.size, 30, 'the page must localize a great deal');
+
+    const missingAr = [...wanted].filter((k) => !ar.has(k));
+    const missingEn = [...wanted].filter((k) => !en.has(k));
+    assert.deepEqual(missingAr, [], `keys with no Arabic string: ${missingAr.join(', ')}`);
+    assert.deepEqual(missingEn, [], `keys with no English string: ${missingEn.join(', ')}`);
+  });
 });
 
 /* -------------------------------------------------------------------------

@@ -48,6 +48,8 @@ import { Conversation, TREE_BY_LANDMARK, muteEvents } from './sim/conversation.j
 import { CinematicDirector, PLAYER_CHARACTER, CINEMATIC_IDS } from './sim/cinematic.js';
 import { StoryState } from './sim/story-state.js';
 import { AISquad, AIState, makeGuard } from './sim/ai.js';
+import { AudioDirector } from './audio/director.js';
+import { createAudioEngine } from './audio/engine.js';
 import { SaveSystem } from './sim/save.js';
 import { SwingPhase, attackProfile } from './sim/combat.js';
 
@@ -108,6 +110,7 @@ export class Game {
     storage = undefined,
     rendererFactory = null,
     inputTarget = undefined,
+    audioFactory = undefined,
   } = {}) {
     this.bus = bus;
     this.canvas = canvas;
@@ -142,6 +145,16 @@ export class Game {
     };
 
     this._storageOpt = storage;
+    /**
+     * The audio engine factory.
+     *
+     * `undefined` means "build one for this environment", which yields a NullAudioEngine
+     * outside a browser so every headless suite exercises the real director against an
+     * engine that cannot make a sound. Injecting a fake WebAudio context instead lets a
+     * suite assert what the game actually tried to play.
+     */
+    this._audioFactory = audioFactory;
+    this.audio = null;
     /**
      * What the InputManager attaches to. `undefined` means "choose correctly": a
      * global window in a browser, the canvas headlessly. An explicit `null` means
@@ -270,6 +283,35 @@ export class Game {
     });
     this.bus.on(Events.PAUSE, () => { this.paused = true; });
     this.bus.on(Events.RESUME, () => { this.paused = false; });
+
+    // Audio is built last and inside a guard. A game that will not boot because it
+    // could not make a sound is a worse outcome than a silent game, and a browser that
+    // refuses an AudioContext is not an error the player caused or can fix. The
+    // director still exists either way, so nothing downstream has to check.
+    try {
+      const engine = typeof this._audioFactory === 'function'
+        ? this._audioFactory()
+        : createAudioEngine({});
+      this.audio = new AudioDirector({
+        bus: this.bus,
+        engine,
+        rng: new RNG(hashString(`${this.seed}:audio`)),
+      });
+      this.audio.attach();
+      report.timings.audioMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+      // A missing AudioContext is recorded, not reported as a problem. Headless is a
+      // supported configuration and so is a browser that refuses to make a sound; a
+      // problem is something the operator has to act on, and there is nothing to do
+      // here. The state is still visible in diagnostics().audio.engine.kind, which is
+      // where anyone investigating a silent game would look.
+      report.audio = engine.available ? 'webaudio' : engine.kind;
+    } catch (err) {
+      // Failing to construct the director at all IS a problem: something downstream
+      // would then call this.audio.update on a null, and the boot report is the only
+      // place that would say so.
+      this.audio = null;
+      report.problems.push(`audio: ${err?.message ?? err}`);
+    }
 
     this.setRegion('palace-court', null);
 
@@ -408,6 +450,10 @@ export class Game {
     this.running = false;
     if (this.rafId && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(this.rafId);
     this.rafId = 0;
+    // Detaching on stop, not only on dispose: a stopped game whose director is still
+    // subscribed keeps building graphs for events nobody will hear, and a test that
+    // boots and stops a dozen games would leak a dozen listeners onto one bus.
+    this.audio?.detach();
   }
 
   _frame(now) {
@@ -453,6 +499,11 @@ export class Game {
 
     this._syncVisuals();
     this.renderer.render(this.camera3d);
+    // Once per rendered frame, not once per fixed step. Audio is continuous and follows
+    // the wall clock; running it inside the accumulator would tie the music's tempo and
+    // the footstep cadence to how many simulation steps happened to fit this frame, so
+    // a dropped frame would slow the score down.
+    this._updateAudio(frameDt);
 
     const t1 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     this.telemetry.frameMs = t1 - t0;
@@ -606,6 +657,38 @@ export class Game {
       // truth carried 0 forever and no guard ever heard a sprint six metres away.
       noiseRadius: Math.max(this.noiseRadius, this.player.noiseRadius ?? 0),
     };
+  }
+
+  /**
+   * What the audio is permitted to know.
+   *
+   * Built here rather than read out of the systems it describes, for the same reason
+   * _buildTruth exists: the director should see the same facts the AI and the renderer
+   * see, taken from the same place at the same moment. A director that reached into
+   * the player controller for its own copy of the noise radius would eventually be
+   * hearing something the guards are not.
+   *
+   * The listener is the camera, which already carries `position`, `right` and
+   * `forward` from its own update earlier this frame.
+   */
+  _updateAudio(dt) {
+    if (!this.audio) return;
+    this.audio.update(dt, {
+      player: {
+        speed: Math.hypot(this.player.velocity.x, this.player.velocity.z),
+        stance: this.player.stance === Stance.CROUCH ? 'crouch' : 'stand',
+        onGround: this.player.grounded !== false,
+        noiseRadius: this.player.noiseRadius ?? 0,
+      },
+      listener: this.camera,
+      detection: this._detectionLevel ?? 'calm',
+      region: this.regionId,
+      weather: this.weather,
+      // A cutscene owns the picture, so it owns the score too: the footsteps stop and
+      // the mode and tempo are chosen for the scene rather than for the danger.
+      cinematic: this.cinematics?.active === true,
+      paused: this.paused === true,
+    });
   }
 
   _inHidingSpot() {
@@ -953,6 +1036,7 @@ export class Game {
       dialogueTreesReachable: Object.keys(TREE_BY_LANDMARK).length,
       cinematic: this.cinematics?.describe() ?? null,
       cinematicsPlayable: CINEMATIC_IDS.length,
+      audio: this.audio ? this.audio.describe() : null,
       perception: this.lastTruth ? {
         lightLevel: Number(this.lastTruth.lightLevel.toFixed(3)),
         inShadow: this.lastTruth.inShadow,

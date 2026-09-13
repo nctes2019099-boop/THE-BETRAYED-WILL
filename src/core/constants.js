@@ -644,3 +644,99 @@ export const A11Y = Object.freeze({
   MAX_FONT_SCALE: 1.6,
   HIGH_CONTRAST_DEFAULT: false,
 });
+
+/**
+ * Audio. Every number here is a tuning decision, not a synthesis detail: the
+ * synthesis lives in src/audio/engine.js and the musical material in
+ * src/audio/theory.js. Nothing is downloaded - the brief requires every asset be
+ * generated procedurally, so a "sample" here is a set of parameters that describe
+ * how to build one.
+ */
+export const AUDIO = Object.freeze({
+  A4: 440,                      // concert pitch; the maqamat are tuned around it
+
+  /* ------------------------------------------------------------------ mixing */
+  MASTER_DEFAULT: 0.85,
+  MUSIC_DEFAULT: 0.5,
+  SFX_DEFAULT: 0.9,
+  AMBIENCE_DEFAULT: 0.42,
+  MUTE_FADE_S: 0.08,            // a hard mute click is louder than the sound it stops
+
+  /* ------------------------------------------------------------------ voices */
+  // Concurrent one-shots before the quietest is stolen. A budget, not a limit on
+  // what may be requested: a combat frame can legitimately ask for a hit, a block,
+  // a shout and three footsteps, and dropping the quietest of them is inaudible
+  // where clipping the master bus is not.
+  MAX_VOICES: 26,
+  VOICE_STEAL_QUIETEST: true,
+  // Anything below this gain is inaudible over the beds and not worth a voice.
+  MIN_AUDIBLE_GAIN: 0.004,
+  // How many recent cues the engine remembers, for diagnostics and for the suite.
+  // Bounded because it is written on every footstep and an unbounded log in a game
+  // that runs for hours is a slow leak nobody attributes to the audio.
+  PLAY_LOG: 64,
+
+  /* -------------------------------------------------------------- footsteps */
+  // Cadence per gait, in seconds between footfalls. Derived from the gait speeds
+  // rather than authored separately: a stride is roughly constant in length, so a
+  // faster gait is a faster cadence, and two independently tuned numbers would
+  // eventually disagree with the animation and with each other.
+  STRIDE_LENGTH_M: 1.35,
+  // A footstep is as loud as the noise the AI hears, normalised against the loudest
+  // authored gait. One number, two consumers: if the player hears a quieter step
+  // than the guard does, the game is lying to one of them.
+  FOOTSTEP_LOUDNESS_REF: STEALTH.NOISE_SPRINT,
+  MIN_FOOTSTEP_GAIN: 0.03,
+  FOOTSTEP_PITCH_SPREAD: 0.06,  // two identical footfalls in a row sound like a machine
+  FOOTSTEP_PAN: 0.18,           // how far off centre each foot lands; they alternate
+  // Below this planar speed the character is standing, not walking. Reusing the
+  // movement system's own stop threshold would be better, but a step fired while
+  // decelerating through zero is the audible symptom of getting this wrong, and it is
+  // worth its own number so it can be tuned against the animation.
+  FOOTSTEP_MIN_SPEED: 0.35,
+
+  /* A cutscene leads with the score: the mode is fixed, the tempo eased back, and the
+     layers opened up, because nothing is being controlled and the music can afford to
+     be the whole of what the player is attending to. */
+  CINEMATIC_MAQAM: 'bayati',
+
+  /* ------------------------------------------------------------------ music */
+  // Four tension layers, one per level the detection meter can draw. The music
+  // responds to the same state the AI is in, so what the player hears and what the
+  // guard is doing cannot drift apart.
+  TENSION_LAYERS: 4,
+  MUSIC_TEMPO_CALM: 62,         // beats per minute
+  MUSIC_TEMPO_COMBAT: 132,
+  MUSIC_LOOKAHEAD_S: 0.35,      // how far ahead the scheduler places notes
+  MUSIC_QUANTUM_S: 0.02,        // a cycle shorter than this is a degenerate tempo
+  MUSIC_MAX_QUEUE: 128,         // bound on pending notes, so a paused clock cannot grow it
+  DRONE_DETUNE_CENTS: 7,        // a single perfectly tuned pair sounds like one voice
+  PLUCK_DECAY_S: 2.4,           // a struck string, not an organ
+  // The three layers are levelled against each other here rather than in the engine,
+  // because their balance is a mixing decision and belongs with the other mix numbers.
+  // The drone is quietest: it is the one layer that never stops, and a continuous
+  // sound at the level of a struck one is not a foundation, it is a hum.
+  DRONE_GAIN: 0.16,
+  DRUM_GAIN: 0.5,
+  MELODY_GAIN: 0.42,
+  DRONE_FADE_S: 2.5,            // a mode change must not arrive as a bump
+  // Below this many beats a cycle is too short for a one-note-per-beat melody, so the
+  // grid halves instead. Keeps every phrase inside its own cycle at any metre.
+  MELODY_MIN_CYCLE_BEATS: 4,
+
+  /* --------------------------------------------------------------- ambience */
+  AMBIENCE_CROSSFADE_S: 1.6,    // a hard bed swap on a doorway reads as a bug
+  WIND_SPEED_GAIN: 0.5,
+  WATER_GAIN: 0.34,
+  CROWD_GAIN: 0.3,
+  RAIN_GAIN: 0.5,
+  STORM_GAIN: 0.68,
+
+  /* ------------------------------------------------------------------- limits */
+  // A cue that can fire every frame must be rate limited, or one stuck event
+  // becomes a machine gun. These are floors, not targets.
+  COOLDOWN_UI_S: 0.05,
+  COOLDOWN_IMPACT_S: 0.06,
+  COOLDOWN_VOICE_S: 0.18,       // two people cannot shout in the same 100ms
+  COOLDOWN_STINGER_S: 4.0,      // a story sting that repeats stops being a sting
+});

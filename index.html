@@ -257,6 +257,19 @@ body.in-cutscene #dialogue { display: none; }
 }
 .sheet h3 { margin: 6px 0 0; font-size: 12px; letter-spacing: 1.5px; color: var(--bronze); text-transform: uppercase; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* Mix faders. The labels follow the page's RTL; the sliders are forced LTR.
+   Reversing a fader with the text direction is technically consistent and practically
+   wrong: every mixer the player has ever used runs left-to-right, and a slider whose
+   direction depends on the interface language is one more thing to relearn. */
+.faders { display: grid; gap: 6px; margin-top: 6px; }
+.fader { display: grid; grid-template-columns: 5.5em 1fr 3em; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-dim, #b9a882); }
+.fader output { direction: ltr; text-align: left; font-variant-numeric: tabular-nums; }
+.fader input[type="range"] {
+  direction: ltr; width: 100%; height: 20px; background: none; cursor: pointer;
+  accent-color: var(--gold);
+}
+.fader input[type="range"]:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
 .btn {
   pointer-events: auto; cursor: pointer;
   padding: 10px 18px; font-size: 14px; font-family: var(--font);
@@ -442,6 +455,38 @@ body.in-cutscene #dialogue { display: none; }
       <button class="btn" data-w="storm" data-i18n="w-storm">عاصفة</button>
     </div>
 
+    <h3 data-i18n="audio">الصوت</h3>
+    <div class="row">
+      <button class="btn" id="muteBtn" aria-pressed="false" data-i18n="a-mute">كتم الصوت</button>
+    </div>
+    <div class="faders" id="faders">
+      <label class="fader">
+        <span data-i18n="a-master">عام</span>
+        <input type="range" id="vol-master" data-bus="master" min="0" max="100" step="1" value="85"
+               aria-label="master volume">
+        <output for="vol-master">85</output>
+      </label>
+      <label class="fader">
+        <span data-i18n="a-music">الموسيقى</span>
+        <input type="range" id="vol-music" data-bus="music" min="0" max="100" step="1" value="50"
+               aria-label="music volume">
+        <output for="vol-music">50</output>
+      </label>
+      <label class="fader">
+        <span data-i18n="a-sfx">المؤثرات</span>
+        <input type="range" id="vol-sfx" data-bus="sfx" min="0" max="100" step="1" value="90"
+               aria-label="effects volume">
+        <output for="vol-sfx">90</output>
+      </label>
+      <label class="fader">
+        <span data-i18n="a-amb">الأجواء</span>
+        <input type="range" id="vol-ambience" data-bus="ambience" min="0" max="100" step="1" value="42"
+               aria-label="ambience volume">
+        <output for="vol-ambience">42</output>
+      </label>
+    </div>
+    <div class="note" id="audioNote"></div>
+
     <div class="row">
       <button class="btn primary" id="resume" data-i18n="resume">متابعة</button>
       <button class="btn" id="toggleTelemetry" data-i18n="telemetry">أرقام الأداء</button>
@@ -472,10 +517,22 @@ body.in-cutscene #dialogue { display: none; }
  */
 import { globalBus, Events } from './src/core/bus.js';
 import { bootGame } from './src/main.js';
-import { SAVE } from './src/core/constants.js';
+import { AUDIO, SAVE } from './src/core/constants.js';
 import { hasPersistentStorage } from './src/platform/browser.js';
 
 const $ = (id) => document.getElementById(id);
+
+/**
+ * Whether this is a touch device.
+ *
+ * Declared here, above the element map and everything else, because it is read at
+ * module scope by the audio wiring and the touch handlers. A `const` used before its
+ * declaration is not undefined - it is a ReferenceError that stops the whole script,
+ * and it stops it before `boot()` is ever called, so the page shows a title and a
+ * progress bar that never moves and reports nothing.
+ */
+const isTouch = (navigator.maxTouchPoints ?? 0) > 0;
+
 const el = {
   boot: $('boot'), bootbar: $('bootbar').firstElementChild, bootstatus: $('bootstatus'), begin: $('begin'),
   objective: $('objective'), chapter: document.querySelector('#objective .chapter'),
@@ -491,9 +548,11 @@ const el = {
   dlgHint: document.querySelector('#dialogue .hint'), dlgLeave: $('dlgLeave'),
   toasts: $('toasts'), telemetry: $('telemetry'),
   pause: $('pause'), slots: $('slots'), storageNote: $('storageNote'), diagOut: $('diagOut'),
+  muteBtn: $('muteBtn'), faders: $('faders'), audioNote: $('audioNote'),
   touch: $('touch'), stick: $('stick'), stickKnob: document.querySelector('#stick i'),
   stickZone: $('stickZone'), lookZone: $('lookZone'),
 };
+if (isTouch) el.touch.classList.add('on');
 
 /* ---------------------------------------------------------------- i18n */
 const STRINGS = {
@@ -504,6 +563,9 @@ const STRINGS = {
     diagnostics: 'التشخيص', health: 'الصحة', stamina: 'اللياقة',
     'q-low': 'منخفضة', 'q-med': 'متوسطة', 'q-high': 'عالية',
     'w-clear': 'صحو', 'w-overcast': 'غائم', 'w-dust': 'غبار', 'w-rain': 'مطر', 'w-storm': 'عاصفة',
+    audio: 'الصوت', 'a-mute': 'كتم الصوت', 'a-unmute': 'إلغاء الكتم',
+    'a-master': 'عام', 'a-music': 'الموسيقى', 'a-sfx': 'المؤثرات', 'a-amb': 'الأجواء',
+    'a-unavailable': 'الصوت غير متاح في هذا المتصفح.',
     'objective-none': 'لا يوجد هدف حالي', prologue: 'المقدمة',
     save: 'حفظ', load: 'تحميل', empty: 'فارغ', autosave: 'حفظ تلقائي', quicksave: 'حفظ سريع',
     'slot-n': 'موضع', 'no-storage': 'التخزين غير متاح في هذا المتصفح: لن يبقى التقدّم بعد إغلاق الصفحة.',
@@ -525,6 +587,9 @@ const STRINGS = {
     diagnostics: 'Diagnostics', health: 'Health', stamina: 'Stamina',
     'q-low': 'Low', 'q-med': 'Medium', 'q-high': 'High',
     'w-clear': 'Clear', 'w-overcast': 'Overcast', 'w-dust': 'Dust', 'w-rain': 'Rain', 'w-storm': 'Storm',
+    audio: 'Audio', 'a-mute': 'Mute', 'a-unmute': 'Unmute',
+    'a-master': 'Master', 'a-music': 'Music', 'a-sfx': 'Effects', 'a-amb': 'Ambience',
+    'a-unavailable': 'Audio is not available in this browser.',
     'objective-none': 'No active objective', prologue: 'Prologue',
     save: 'Save', load: 'Load', empty: 'Empty', autosave: 'Autosave', quicksave: 'Quicksave',
     'slot-n': 'Slot', 'no-storage': 'Storage is unavailable in this browser: progress will not survive closing the page.',
@@ -667,8 +732,10 @@ function togglePause() {
 }
 
 $('resume').addEventListener('click', closePause);
-$('lang-ar').addEventListener('click', () => { applyLanguage('ar'); game?.setLanguage('ar'); });
-$('lang-en').addEventListener('click', () => { applyLanguage('en'); game?.setLanguage('en'); });
+// The mute button's label is chosen at runtime, so applyLanguage alone would leave it
+// showing the previous language's word for the current state.
+$('lang-ar').addEventListener('click', () => { applyLanguage('ar'); game?.setLanguage('ar'); refreshMuteButton(); });
+$('lang-en').addEventListener('click', () => { applyLanguage('en'); game?.setLanguage('en'); refreshMuteButton(); });
 $('toggleTelemetry').addEventListener('click', () => {
   el.telemetry.classList.toggle('on');
   closePause();
@@ -689,6 +756,145 @@ for (const btn of document.querySelectorAll('#weatherRow .btn')) {
     btn.setAttribute('aria-pressed', 'true');
     game?.setWeather(btn.dataset.w);
   });
+}
+
+/* ---------------------------------------------------------------- audio mix
+ * The faders, the mute button, and the interface clicks.
+ *
+ * This block owns the DOM side only. What a level means, how a mute ramps, and which
+ * bus a cue belongs to are all the director's and the engine's business; the page
+ * reads the defaults out of AUDIO rather than restating them, so a balance change in
+ * src/ moves the sliders too instead of leaving them showing a number the game does
+ * not use.
+ */
+const AUDIO_KEY = `${SAVE.KEY_PREFIX}audio`;
+
+/**
+ * The authored mix, read from the constants rather than retyped.
+ *
+ * A slider that starts at 80 because someone wrote 80 into the markup, in a game whose
+ * master bus actually opens at 85, is a control that lies about the state it is
+ * showing. Reading the constant makes that disagreement impossible.
+ */
+const AUDIO_DEFAULTS = Object.freeze({
+  master: AUDIO.MASTER_DEFAULT,
+  music: AUDIO.MUSIC_DEFAULT,
+  sfx: AUDIO.SFX_DEFAULT,
+  ambience: AUDIO.AMBIENCE_DEFAULT,
+});
+const mix = loadMix();
+
+/** Read the saved mix. Anything malformed falls back to the authored defaults. */
+function loadMix() {
+  const fallback = { muted: false, volumes: { ...AUDIO_DEFAULTS } };
+  if (!hasPersistentStorage()) return fallback;
+  try {
+    const raw = localStorage.getItem(AUDIO_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    const volumes = {};
+    for (const bus of Object.keys(AUDIO_DEFAULTS)) {
+      const v = Number(parsed?.volumes?.[bus]);
+      volumes[bus] = Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : AUDIO_DEFAULTS[bus];
+    }
+    return { muted: parsed?.muted === true, volumes };
+  } catch {
+    // A corrupt preference is worth exactly nothing. Falling back is the whole
+    // recovery, and refusing to boot the menu over it would be absurd.
+    return fallback;
+  }
+}
+
+function saveMix(mix) {
+  if (!hasPersistentStorage()) return false;
+  try { localStorage.setItem(AUDIO_KEY, JSON.stringify(mix)); return true; } catch { return false; }
+}
+
+/** Push one fader's value into the director and into the saved mix. */
+function applyBus(bus, value0to1) {
+  const director = game?.audio;
+  if (!director) return false;
+  if (!director.setVolume(bus, value0to1)) return false;
+  mix.volumes[bus] = value0to1;
+  saveMix(mix);
+  // Same shape input.js and renderer.js use, so a consumer of SETTINGS_CHANGED does
+  // not need to know which subsystem changed.
+  globalBus.emit(Events.SETTINGS_CHANGED, { scope: 'audio', bus, value: value0to1 });
+  return true;
+}
+
+function refreshMuteButton() {
+  const muted = game?.audio?.muted === true;
+  el.muteBtn.setAttribute('aria-pressed', muted ? 'true' : 'false');
+  el.muteBtn.setAttribute('data-i18n', muted ? 'a-unmute' : 'a-mute');
+  el.muteBtn.textContent = t(muted ? 'a-unmute' : 'a-mute');
+}
+
+/** Set the faders from a mix, without re-saving what was just loaded. */
+function drawMix() {
+  for (const input of el.faders.querySelectorAll('input[type="range"]')) {
+    const bus = input.dataset.bus;
+    const value = mix.volumes[bus] ?? AUDIO_DEFAULTS[bus];
+    input.value = String(Math.round(value * 100));
+    input.nextElementSibling.textContent = String(Math.round(value * 100));
+  }
+  refreshMuteButton();
+}
+
+/** Bring the sliders up to a game that has just booted, and say if it is silent. */
+function bindAudio() {
+  const director = game?.audio;
+  if (!director) {
+    el.audioNote.textContent = t('a-unavailable');
+    for (const input of el.faders.querySelectorAll('input[type="range"]')) input.disabled = true;
+    el.muteBtn.disabled = true;
+    return;
+  }
+  // A browser with no AudioContext is not an error to hide: the player should be told
+  // the game is silent rather than left turning a fader that does nothing.
+  el.audioNote.textContent = director.available ? '' : t('a-unavailable');
+  for (const bus of Object.keys(mix.volumes)) director.setVolume(bus, mix.volumes[bus]);
+  director.setMuted(mix.muted);
+  drawMix();
+}
+
+el.muteBtn.addEventListener('click', () => {
+  if (!game?.audio) return;
+  mix.muted = game.audio.toggleMute();
+  saveMix(mix);
+  refreshMuteButton();
+  globalBus.emit(Events.SETTINGS_CHANGED, { scope: 'audio', bus: 'mute', value: mix.muted });
+});
+
+for (const input of el.faders.querySelectorAll('input[type="range"]')) {
+  // `input` rather than `change`: a fader that only speaks on release feels broken
+  // while it is being dragged, and the engine ramps rather than snapping so there is
+  // no click to avoid.
+  input.addEventListener('input', () => {
+    const pct = Number(input.value) / 100;
+    input.nextElementSibling.textContent = input.value;
+    applyBus(input.dataset.bus, pct);
+  });
+}
+
+/* Interface clicks.
+ *
+ * Delegated over the whole document rather than attached per button, because the save
+ * slots and the dialogue choices are rebuilt constantly and a per-button listener
+ * would have to be re-attached every time - which is how a menu ends up half silent.
+ * Hover is left out on touch: a finger has no hover, and firing it on tap would play
+ * two clicks for one press.
+ */
+document.addEventListener('click', (e) => {
+  const button = e.target instanceof Element ? e.target.closest('button, .tbtn, .slot') : null;
+  if (!button) return;
+  game?.audio?.cue('ui-click');
+}, true);
+if (!isTouch) {
+  document.addEventListener('pointerover', (e) => {
+    const button = e.target instanceof Element ? e.target.closest('#pause .btn, #boot .btn') : null;
+    if (button) game?.audio?.cue('ui-hover');
+  }, true);
 }
 
 /* ---------------------------------------------------------- bus -> HUD */
@@ -844,8 +1050,6 @@ globalBus.on(Events.CONTEXT_RESTORED, () => toast(t('ctx-restored')));
 globalBus.on(Events.ERROR, (e) => { if (e?.message) toast(String(e.message), 'warn'); });
 
 /* -------------------------------------------------------- touch controls */
-const isTouch = (navigator.maxTouchPoints ?? 0) > 0;
-if (isTouch) el.touch.classList.add('on');
 
 let stickId = null;
 let stickOrigin = { x: 0, y: 0 };
@@ -1003,11 +1207,19 @@ async function boot() {
 
     // The pointer lock is requested on a gesture, because browsers reject it
     // otherwise and the rejection is not something to surface at boot.
+    // The audio is bound here rather than at boot, and unlocked from this click.
+    // A browser suspends an AudioContext that was not started by a user gesture, so
+    // constructing one during boot produces a game that is silent forever and reports
+    // nothing wrong. This click is the first gesture the page gets.
+    bindAudio();
     el.begin.style.display = '';
     el.begin.addEventListener('click', () => {
       el.boot.classList.add('hidden');
       setTimeout(() => { el.boot.style.display = 'none'; }, 620);
       if (!isTouch) $('view').requestPointerLock?.();
+      // Unlocked inside the handler, not before it: the gesture requirement is the
+      // whole reason this line is here.
+      game.audio?.unlock();
       globalBus.emit(Events.RESUME, {});
     }, { once: true });
 
@@ -1048,9 +1260,17 @@ document.addEventListener('keydown', (e) => {
 // A hidden tab should not keep simulating: the accumulator would fill and the
 // player would return to a character who ran into a wall for five minutes.
 document.addEventListener('visibilitychange', () => {
+  // Both directions matter. Hiding suspends the audio clock, which is also what stops
+  // the note scheduler queueing into a context that is not running; coming back has to
+  // resume it, or the game returns from a tab switch permanently silent.
+  game?.audio?.setHidden(document.hidden);
   if (document.hidden) {
     globalBus.emit(Events.PAUSE, {});
     el.pause.classList.contains('on') || openPause();
+  } else {
+    // A context suspended by the browser while hidden needs a resume, and this is the
+    // only moment we get one without asking the player for another gesture.
+    game?.audio?.engine.resume();
   }
 });
 
