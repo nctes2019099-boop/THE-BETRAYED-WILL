@@ -104,7 +104,6 @@ export const MANUAL_CUES = Object.freeze({
   'arrow-hit': Object.freeze({ via: 'pending', reason: 'No bow or projectile system is built yet.' }),
   'evidence-linked': Object.freeze({ via: 'pending', reason: 'The investigation board is not built yet.' }),
   conclusion: Object.freeze({ via: 'pending', reason: 'The investigation board is not built yet.' }),
-  takedown: Object.freeze({ via: 'pending', reason: 'Stealth takedowns are authored in constants but never emitted.' }),
   shout: Object.freeze({ via: 'pending', reason: 'No AI vocalisation events are emitted yet.' }),
 });
 
@@ -485,8 +484,14 @@ export function cueReachability() {
     if (typeof binding.cue === 'function') continue;
     add(binding.cue, event, 'bus', 'Event binding.');
   }
-  add('land-light', Events.NOISE_EMITTED, 'bus', 'Chosen from the noise source field.');
-  add('land-heavy', Events.NOISE_EMITTED, 'bus', 'Chosen from the noise source field.');
+  // Cues the noise binding reaches by reading `source` off the payload. Listed rather
+  // than inferred, because a binding whose cue is a function is skipped above - and
+  // 'takedown' sat in MANUAL_CUES as pending for as long as stealth takedowns were
+  // authored in constants and emitted by nothing. They are emitted now, at
+  // STEALTH.NOISE_TAKEDOWN, from main.js._performTakedown().
+  for (const cue of ['land-light', 'land-heavy', 'takedown']) {
+    add(cue, Events.NOISE_EMITTED, 'bus', 'Chosen from the noise source field.');
+  }
 
   for (const [cue, meta] of Object.entries(MANUAL_CUES)) {
     add(cue, meta.via === 'frame' ? 'director.update()' : 'director.cue()', meta.via, meta.reason);

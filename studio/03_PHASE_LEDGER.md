@@ -68,10 +68,10 @@ Every number below is the suite's own reported score, from
 | reach-test.mjs | 22/22 PASS | `node tests/reach-test.mjs` |
 | runtime-test.mjs | 98/98 PASS | `node tests/runtime-test.mjs` |
 | playthrough.mjs | 14/14 PASS | `node tests/playthrough.mjs` |
-| battle-test.mjs | 45/45 PASS | `node tests/battle-test.mjs` |
+| battle-test.mjs | 58/58 PASS | `node tests/battle-test.mjs` |
 | cinematic-test.mjs | 35/35 PASS | `node tests/cinematic-test.mjs` |
 | audio-test.mjs | 62/62 PASS | `node tests/audio-test.mjs` |
-| **TOTAL** | **693/693 PASS** | `bash run.sh` |
+| **TOTAL** | **706/706 PASS** | `bash run.sh` |
 
 `battle-test.mjs` is a **required** suite, not an additional one. It is the only gate
 that drives combat through the real frame loop; the two suites that already covered
@@ -136,14 +136,14 @@ Status is the exit gate, not the existence of code.
 | **A** AI and enemy behaviour | AI never cheats; perception, memory, flanking, retreat verified | 🟢 SUBSTANTIALLY MET | `ai-test` 79/79. Perception truth carries the real noise radius (`main.js._buildTruth`); hearing verified end to end by runtime-test IX6/IX7. The AI reads only `truth`, never player state. |
 | **B** Input / gamepad | full gamepad navigation; no lag, sliding or unwanted drift | 🟢 SUBSTANTIALLY MET | `input-test` 57/57; runtime VIII2–VIII4 cover the touch surface. Gamepad poller wired in `core/input.js`. |
 | **C** Real bow / projectile | bow fires a true projectile — travel, drop, impact | 🔴 **NOT BUILT** | `PROJ` constants exist and are referenced by nothing: `grep -rn "PROJ\." src/` returns no hits. `main.js` tracks `aiming` / `drawing` intent with no system consuming it. Three audio cues are marked pending on this. |
-| **D** Finisher & contextual combat camera | zero geometry penetration; no violent snap | 🟡 PARTIAL | `camera-test` 40/40, `cinematic-test` 35/35, `battle-test` 45/45. Melee, blocking, parry, dodging, lock-on and hitstop are all reachable in play and gated. **The finisher is not**: `canFinisher()` has no call site and `PlayerState.FINISHER` cannot be entered, because the only route into it is a takedown and `canTakedown()` has no call site either. Downgraded from 🟢 by battle-test J2, which audits exactly this. |
+| **D** Finisher & contextual combat camera | zero geometry penetration; no violent snap | 🟢 SUBSTANTIALLY MET | `camera-test` 40/40, `cinematic-test` 35/35, `battle-test` 58/58. Melee, blocking, parry, dodging, lock-on, hitstop, **takedowns and the execution** are all reachable in play and gated. The camera's FINISHER mode is fed a victim and holds a finite position through the whole act (battle-test N3). Was 🟡 for one commit while `canTakedown()` and `canFinisher()` had no call site; see §7.2. |
 | **E** Fall / ledge systems | fall damage and ledge grab functional; vertical traversal tested | 🟢 SUBSTANTIALLY MET | `movement-test` 38/38. `PLAYER_LANDED`, `PLAYER_LEDGE_GRAB`, authored light/heavy landing noise split at `FALL_DAMAGE_SAFE_HEIGHT`. |
 | **F** Character visual quality | distinct faces and silhouettes; historical clothing; no placeholders | 🟡 PARTIAL | `render/characters.js` builds a proportioned rig with beard, silhouette and stride. **Not screenshot-verified**, which the gate requires. The brief's 22 distinct models are not built; the rig is parameterised over the cast. |
 | **G** World visual & historical authenticity | dense, purposeful, believable; no European/Gothic/modern elements | 🟡 PARTIAL | 20 regions, 142 landmarks, 26 materials. Historical vocabulary gate passes in `lint.sh`. Visual density is not independently reviewed. |
-| **H** Mission / story polish | all chapters, missions, trees, clues and cinematics completable | 🟢 SUBSTANTIALLY MET | `playthrough` 14/14, `cinematic-test` 35/35, `battle-test` 45/45. All §4 content counts reached; objectives defer completion until a cinematic has actually run. **Every required objective in the story is now satisfiable from play** — battle-test J4 asserts an empty blocked list and counts the six event-driven objectives it is checking. Was 🟡 for one commit while m11/o5 was open; see §7. |
+| **H** Mission / story polish | all chapters, missions, trees, clues and cinematics completable | 🟢 SUBSTANTIALLY MET | `playthrough` 14/14, `cinematic-test` 35/35, `battle-test` 58/58. All §4 content counts reached; objectives defer completion until a cinematic has actually run. **Every required objective in the story is now satisfiable from play** — battle-test J4 asserts an empty blocked list and counts the six event-driven objectives it is checking. Was 🟡 for one commit while m11/o5 was open; see §7. |
 | **I** UI / UX / audio / localisation | Arabic complete and RTL correct; instant switching; no major missing audio; music transitions | 🟢 SUBSTANTIALLY MET | Arabic is the default and RTL-first. Language switching is instant and re-renders every `data-i18n` node. **Audio closed 2026-09-13** — see §6. runtime VIII10 now proves every key exists in both languages. |
 | **J** Performance | §24 ledger within budget; every optimisation reports BEFORE/AFTER/CHANGE %/QUALITY IMPACT | 🟡 PARTIAL | Per-frame telemetry is measured and exposed. No optimisation has yet been performed, so no BEFORE/AFTER rows exist to report. |
-| **K** Full QA | all regression suites pass; Level 3 playthrough; §25 reliability matrix | 🟡 PARTIAL | 693/693 across 13 suites. The §25 reliability matrix is not yet written. |
+| **K** Full QA | all regression suites pass; Level 3 playthrough; §25 reliability matrix | 🟡 PARTIAL | 706/706 across 13 suites. The §25 reliability matrix is not yet written. |
 | **L** Release preparation | §36 Final Release Gate — all ten blocks green | 🔴 NOT STARTED | Certifies a frozen build. C and F are open. |
 
 Standing: **Agent 16 (save / reliability)** runs continuously, not as a phase. Save and
@@ -169,9 +169,10 @@ Commit `9a44669`. Three modules under `src/audio/`, wired through `main.js` and
 | Silence is a supported configuration, not an error | audio-test B1, C20, D1 |
 | Mix faders and mute in the pause menu, persisted | `index.html` `#faders`, `AUDIO_KEY` |
 
-Seven cues are declared **pending** rather than left as dead data, each with the reason
+**Six** cues are declared **pending** rather than left as dead data, each with the reason
 recorded in `MANUAL_CUES`: three await the bow (phase C), two await the investigation
-board, one awaits stealth takedown emission, one awaits AI vocalisation. Reproduce the
+board, one awaits AI vocalisation. The seventh — `takedown` — was closed on 2026-09-13
+when stealth takedowns became performable; see §7.2. Reproduce the
 accounting with audio-test C2, which fails if any cue becomes unreachable without a
 decision being recorded.
 
@@ -261,6 +262,58 @@ absence let this ship.
 
 ---
 
+### 7.2 Takedowns, executions, and the third instance of the same bug
+
+`canTakedown()` and `canFinisher()` were the two combat gates with no call site, named as
+pending by battle-test J2 the moment that audit existed. Both are wired now:
+
+| | |
+|---|---|
+| **Takedown** | Offered by the interaction prompt — the same key as everything else, because a takedown is something you do to the world in front of you and the player should not need a second vocabulary. `_takedownCandidate()` takes the *nearest* qualifying guard rather than the first in array order, re-checks the gate at the moment of the act, and refuses outright when `_detectionLevel === 'combat'`. Lethal, and it notifies `EventKind.TAKEDOWN` and **not** `KILL`: the content asks for them as different things — m04/o5 wants a watching servant silenced, m06/o5 wants guards faced — and counting one as the other would let a player who never drew a sword complete a mission written about a fight. |
+| **Execution** | Judged *before* `resolveMelee()`, at the moment a swing connects, because it replaces the blow rather than following it: running the ordinary resolver first would spend the swing on 9 damage and a stagger before the moment arrived. `player.startFinisher()` and the camera's FINISHER mode were both written and both unreachable, since nothing put a victim in `ctx.finisher`. |
+
+Both are loud or quiet by exactly the authored amount, and the difference is the design:
+`NOISE_TAKEDOWN` is 6.5 m against `NOISE_COMBAT_HIT`'s 22 m. A silent removal that rang
+out like a sword fight would take away the only reason to use one (M3, N6).
+
+**The third instance of the same bug class.** Wiring the takedown exposed that
+`EnemyAgent` passed its bus to the agent and **not to the `Combatant` it builds**, so
+`Combatant.die()` — the one place every death passes through — emitted `COMBAT_KILL` into
+a null bus. A guard killed by anything other than `resolveMelee()` died silently: no HUD,
+no music sting, no cue. `resolveMelee()` had its own `COMBAT_KILL` emission, which is why
+a sword kill looked fine and hid it.
+
+That emission is now removed and the body has the bus, so there is **one death event from
+one place**, whichever way the death happened. No information was lost: the `COMBAT_HIT`
+beside it already carries attacker, defender and kind with `killed: true`, and `die()`
+carries the attacker as `source`.
+
+**And a wrong sound, found by the same audit.** `_worldNoise()`'s `source` string is the
+cue id, and `NOISE_EMITTED` falls back to `'land-light'` for anything the catalogue does
+not know. The combat noise was emitted as `'combat-hit'`, which is not a cue — so a sword
+connecting with a person played a soft landing. The hearing model was right, the sound was
+wrong, and nothing connected the two. It is `'hit-flesh'` now, the cue `COMBAT_HIT`
+already plays, with `CUE_COOLDOWNS` making one blow one sound. battle-test **F5** asserts
+every world-noise source a fight makes is a cue the catalogue actually has.
+
+**One reporter defect, fixed.** `harness.mjs` printed a failed assertion's detail with
+`JSON.stringify`, which throws on a cycle — and an agent holds its squad, which holds its
+agents. The throw landed in the reporter, after every test had run, so one circular value
+in one failed assertion replaced the whole failure list *and the RESULT line* with a stack
+trace, and `run.sh` read a missing RESULT as a crash rather than as the failures it was
+about to be told about. It uses the harness's own `fmt()`, which already caught cycles and
+was simply not being used.
+
+battle-test is now 58 tests in 9 groups; `PENDING_WIRING` and `PENDING_EVENTS` are both
+empty, and stay in the file because the audit that reads them is what found the gaps.
+
+Teeth verified by mutation, each caught by exactly the test that should catch it:
+takedown ignoring detection → M4; takedown at the combat radius → M3; finisher ignoring
+`FINISHER_HEALTH_THRESHOLD` → N4, E2, E5, J2; noise source that is not a cue → F1, F4, F5,
+N6. Restored, 58/58.
+
+---
+
 ## 8. OPEN BLOCKERS
 
 Ordered by charter C-4 (player experience first) and C-10 (no P3 while a P0/P1 is open).
@@ -269,7 +322,7 @@ The combat P0 that headed this list is closed — see §7.
 | # | Priority | Item | Why it blocks |
 |---|---|---|---|
 | 1 | ~~**P0**~~ | ~~m11/o5 — the last objective of the last mission cannot be completed from play~~ | **CLOSED 2026-09-13**, see §7.1. battle-test J4 now asserts the blocked list is *empty*, so a second objective of this kind fails the baseline instead of being discovered by a player. |
-| 2 | **P1** | Takedowns and finishers have no input path | `canTakedown()` and `canFinisher()` are authored and have no call site; `PlayerState.FINISHER` and the camera's FINISHER mode are unreachable. m04/o5 (optional) waits on the takedown. One audio cue waits on it. Tracked by battle-test J2. |
+| 2 | ~~**P1**~~ | ~~Takedowns and finishers have no input path~~ | **CLOSED 2026-09-13**, see §7.2. Both gates are called from `main.js`, m04/o5 is reachable, the `takedown` audio cue is out of `MANUAL_CUES`, and battle-test J2's pending list is empty. |
 | 3 | **P1** | Phase C — no bow or projectile system | The gate requires a true projectile, not long-reach melee. `aiming` and `drawing` intent are sampled every frame and consumed by nothing, so the player can hold a button that does nothing. Three authored audio cues wait on it. |
 | 4 | **P1** | Phase F — no visual verification | The gate requires screenshot verification and distinct faces. Nothing has been looked at. A rig that is correct in arithmetic and wrong on screen passes every suite written so far. |
 | 5 | **P2** | Phase J — no §24 metric ledger | Performance claims cannot be made without a BEFORE row, and no optimisation has been attempted, so there is no BEFORE to record. |

@@ -228,7 +228,13 @@ export async function runAll(opts = {}) {
     for (const f of failures) {
       console.log(`  ${c('dim', '•')} ${f.suite} → ${f.test}`);
       console.log(`    ${c('red', f.error?.message ?? String(f.error))}`);
-      if (f.error?.detail) console.log(`    ${c('dim', JSON.stringify(f.error.detail))}`);
+      // fmt(), not JSON.stringify: it already catches the cycle and the BigInt and falls
+      // back to a type name. Stringify throws here, in the reporter, after every test has
+      // run - so one circular value in one failed assertion (an agent holds its squad,
+      // which holds its agents) replaced the whole failure list and the RESULT line with
+      // a stack trace, and run.sh read a missing RESULT as a crash rather than as the
+      // failures it was about to be told about.
+      if (f.error?.detail !== undefined) console.log(`    ${c('dim', fmt(f.error.detail))}`);
     }
   }
 

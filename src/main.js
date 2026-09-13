@@ -53,8 +53,9 @@ import { createAudioEngine } from './audio/engine.js';
 import { SaveSystem } from './sim/save.js';
 import {
   SwingPhase, attackProfile, resolveMelee, pickLockTarget, HitOutcome,
-  advanceHitstop, hitstopActive, HITSTOP_TIME_SCALE,
+  advanceHitstop, hitstopActive, HITSTOP_TIME_SCALE, canTakedown, canFinisher,
 } from './sim/combat.js';
+import { PlayerState } from './sim/player.js';
 
 import { CLUES } from './content/story.js';
 import { detectStorage, gamepadPoller } from './platform/browser.js';
@@ -87,6 +88,9 @@ const CLUE_BY_LANDMARK = new Map(CLUES.map((c) => [c.landmark, c.id]));
  * where the prompt is decided and the UI only draws what it is given. A verb table
  * in two places is two tables that drift.
  */
+/** What the takedown prompt calls its target. Agents carry an id and no display name. */
+const TAKEDOWN_LABEL = Object.freeze({ ar: 'الحارس', en: 'Guard' });
+
 const INTERACT_VERBS = Object.freeze({
   examine: { ar: 'افحص', en: 'Examine' },
   clue: { ar: 'افحص', en: 'Examine' },
@@ -104,6 +108,10 @@ const INTERACT_VERBS = Object.freeze({
   // the story sent them to and carrying what they were sent to read. Without it the
   // hearth keeps saying "Talk" after the conversation has ended.
   present: { ar: 'اقرأ جهارًا', en: 'Read aloud' },
+  // Offered when the player is behind a guard who has not seen them. Same key as every
+  // other interaction, because a takedown is something you do to the world in front of
+  // you and the player should not have to learn a second vocabulary for it.
+  takedown: { ar: 'حيّد', en: 'Subdue' },
 });
 
 export class Game {
@@ -146,6 +154,8 @@ export class Game {
      * which is the opposite of what the technique is for.
      */
     this.hitstop = 0;
+    /** The agent being executed, for the camera. Cleared the frame the act ends. */
+    this._finisherVictim = null;
     this._lockSwitchCooldown = 0;
     this.aiming = false;
     this.drawing = false;
@@ -666,10 +676,21 @@ export class Game {
       // charge. A cinematic normally runs through _cinematicFrame instead, but a
       // caller driving _fixedUpdate directly still gets a correct camera.
       cinematic: this.cinematics?.active ? this.cinematics.cameraPayload() : null,
+      // The camera's FINISHER mode is written and unreachable without this: _inferMode()
+      // keys on ctx.finisher, and _updateFinisher() frames the pair with COMBAT's own
+      // finisher constants. Null while nothing is executing, which leaves the gameplay
+      // solver in charge.
+      finisher: this.player.state === PlayerState.FINISHER ? this._finisherShot() : null,
     };
 
     this._updateLockOn(intent, worldDt);
     this.player.update(worldDt, intent, ctx);
+    // Cleared after the player updates, not before: the act ends inside player.update, on
+    // the frame its own clock passes FINISHER_DURATION, and clearing earlier would leave
+    // the camera holding a victim for one frame after the execution was over. ctx was
+    // already built from the state as it stood at the top of the frame, so this frame's
+    // shot is still framed and the next one is not.
+    if (this.player.state !== PlayerState.FINISHER) this._finisherVictim = null;
     this.camera.update(worldDt, this.player, ctx);
 
     // Noise decays. The value came from the movement system; keeping it forever
@@ -722,11 +743,20 @@ export class Game {
     if (swing && swing.phase === SwingPhase.ACTIVE && !swing.hitConsumed) {
       const target = this._pickStrikeTarget();
       if (target) {
-        const result = resolveMelee(player, target.body, swing, {
-          bus: this.bus, source: player.id,
-        });
-        if (result.outcome !== HitOutcome.MISS) {
-          this._afterBlow(result, target, false);
+        // A guard nearly dead, in reach and in front is an execution rather than another
+        // hit. Judged before resolveMelee() because the finisher replaces the blow: it
+        // has its own duration, its own invulnerability and its own camera, and running
+        // the ordinary resolver first would spend the swing on 9 damage and a stagger
+        // before the moment arrived.
+        if (player.state !== PlayerState.FINISHER && canFinisher(player, target.body).ok) {
+          this._performFinisher(target);
+        } else {
+          const result = resolveMelee(player, target.body, swing, {
+            bus: this.bus, source: player.id,
+          });
+          if (result.outcome !== HitOutcome.MISS) {
+            this._afterBlow(result, target, false);
+          }
         }
       }
     }
@@ -788,7 +818,7 @@ export class Game {
     // position rather than through the player's own noise latch, so agents near the blow
     // hear it once and only once.
     if (result.applied > 0 || result.killed) {
-      this._worldNoise(STEALTH.NOISE_COMBAT_HIT, pos, 'combat-hit');
+      this._worldNoise(STEALTH.NOISE_COMBAT_HIT, pos, 'hit-flesh');
     }
     if (result.parried) {
       // A parry is steel on steel and carries further than flesh, but it is the sound
@@ -818,6 +848,128 @@ export class Game {
    * _noiseSub. Agents receive it by position with a distance cutoff, which is the same
    * model the hearing system already uses for the player's footsteps.
    */
+  /* ------------------------------------------------- takedowns and finishers */
+
+  /**
+   * Whether the guards can currently see the player.
+   *
+   * Read off the level the HUD already draws rather than recomputed here, so the meter
+   * and the stealth layer cannot disagree about the one fact that decides whether a
+   * takedown is allowed. 'combat' is the level that means somebody is openly hostile or
+   * suspicion has reached SUSPICION_COMBAT_THRESHOLD; below it the player has not been
+   * seen, whatever the guards suspect.
+   */
+  _isDetected() {
+    return this._detectionLevel === 'combat';
+  }
+
+  /**
+   * The guard the player could take down right now, or null.
+   *
+   * Nearest of the ones that qualify, because canTakedown() is a gate and not a choice:
+   * two guards standing one behind the other both pass it, and taking the first in array
+   * order would silence whichever the squad happened to build first.
+   */
+  _takedownCandidate() {
+    const player = this.player;
+    if (!player || player.isDead || !this.squad) return null;
+    if (player.state === PlayerState.FINISHER) return null;
+    const detected = this._isDetected();
+    let best = null;
+    let bestDist = Infinity;
+    for (const agent of this.squad.agents) {
+      if (agent.body.isDead) continue;
+      const gate = canTakedown(player, agent.body, { detected });
+      if (!gate.ok) continue;
+      if (gate.distance < bestDist) { bestDist = gate.distance; best = agent; }
+    }
+    return best;
+  }
+
+  /**
+   * Silence the guard the player crept up behind.
+   *
+   * Lethal, and deliberately not a kill for the mission system's purposes: the content
+   * asks for takedowns and for kills as different things - m04/o5 wants a watching
+   * servant silenced, m06/o5 wants guards faced - and counting one as the other would
+   * let a player who never drew a sword complete a mission written about a fight.
+   * Combatant.die() still emits COMBAT_KILL with source 'takedown', so anything drawing
+   * a body or playing a death knows one happened; it is the objective that distinguishes.
+   *
+   * @returns {boolean} whether the takedown happened
+   */
+  _performTakedown(agent) {
+    const player = this.player;
+    if (!agent || agent.body.isDead || !player || player.isDead) return false;
+    // Re-checked at the moment of the act rather than trusted from the frame the prompt
+    // was published: the guard may have turned in between, and a takedown that works
+    // from the front is not a takedown, it is a free kill.
+    if (!canTakedown(player, agent.body, { detected: this._isDetected() }).ok) return false;
+
+    const pos = agent.body.pos;
+    agent.onDeath('takedown');
+
+    // The commitment. TAKEDOWN_DURATION is the authored length of the act, and spending
+    // it through the attack lock means the player cannot swing or dodge out of it - which
+    // is what makes choosing to creep up behind a guard a decision with a cost.
+    player.attackLock = Math.max(player.attackLock, STEALTH.TAKEDOWN_DURATION);
+    this.hitstop = Math.max(this.hitstop, COMBAT.HITSTOP_LIGHT);
+
+    // Quiet, and quiet by exactly the authored amount: NOISE_TAKEDOWN is 6.5m against
+    // NOISE_COMBAT_HIT's 22m. _worldNoise already tells the squad by position and radius,
+    // so a killing that nobody within earshot is deaf to is still a killing that carries
+    // 6.5m and no further. A silent removal that rang out like a sword fight would take
+    // away the only reason to use one.
+    this._worldNoise(STEALTH.NOISE_TAKEDOWN, pos, 'takedown');
+    this.missions.notify({ kind: EventKind.TAKEDOWN, id: agent.id });
+    return true;
+  }
+
+  /**
+   * Execute a guard who is nearly dead, in reach and in front.
+   *
+   * The gates were authored in combat.js and the camera's FINISHER mode was written and
+   * tested; neither could be reached, because nothing ever called startFinisher() and
+   * nothing ever put a victim in the camera context. Both are wired here.
+   */
+  _performFinisher(agent) {
+    const player = this.player;
+    const swing = player.swing;
+    // One finisher per swing, for the reason resolveMelee() marks a swing consumed: the
+    // active window lasts several frames and an execution must not happen three times.
+    if (swing) swing.hitConsumed = true;
+
+    const pos = agent.body.pos;
+    this._finisherVictim = agent;
+    player.startFinisher();
+    agent.onDeath('finisher');
+
+    this.hitstop = Math.max(this.hitstop, COMBAT.HITSTOP_KILL);
+    // _worldNoise() alarms the squad at the radius it is given, so NOISE_COMBAT_HIT here
+    // is already "everybody within 22m stops what they are doing". Calling notifyAll as
+    // well would tell them twice about one execution.
+    this._worldNoise(STEALTH.NOISE_COMBAT_HIT, pos, 'hit-flesh');
+    this._worldNoise(STEALTH.NOISE_BODY_FALL, pos, 'body-fall');
+    this.missions.notify({ kind: EventKind.KILL, id: agent.id });
+    return true;
+  }
+
+  /**
+   * What the camera needs to frame an execution: the victim, and how far through the
+   * authored duration the act is. COMBAT.FINISHER_DURATION is the same number
+   * player._updateFinisher() ends the state on, so the shot cannot outlive the act.
+   */
+  _finisherShot() {
+    const victim = this._finisherVictim;
+    if (!victim?.body) return null;
+    return {
+      victim: victim.body,
+      elapsed: this.player.finisherTime ?? 0,
+      duration: COMBAT.FINISHER_DURATION,
+      orbitSpeed: 0.42,
+    };
+  }
+
   _worldNoise(radius, pos, source) {
     this.bus.emit(Events.NOISE_EMITTED, {
       radius, source, local: false,
@@ -1010,11 +1162,22 @@ export class Game {
   _updateInteraction() {
     if (this.conversation?.active || this.cinematics?.active) return;
     const p = this.player.pos;
-    const target = this._nearestInteractable();
+    // Checked before the world, not after it. A guard the player has crept up behind is
+    // the most urgent thing on screen, and a prompt that loses to a nearby jar tells the
+    // player the stealth layer is not listening.
+    const victim = this._takedownCandidate();
+    const target = victim ? null : this._nearestInteractable();
     const door = target ? null : this.space?.nearestDoor(p.x, p.z, DOOR_PROMPT_M);
 
     let next = null;
-    if (target) {
+    if (victim) {
+      next = {
+        kind: 'takedown', id: victim.id,
+        label: TAKEDOWN_LABEL[this.language],
+        action: INTERACT_VERBS.takedown[this.language],
+        hasTree: false,
+      };
+    } else if (target) {
       const presenting = this.missions.presentationAt(target.id);
       const verb = presenting
         ? INTERACT_VERBS.present
@@ -1071,6 +1234,12 @@ export class Game {
    * nothing, which is the most common way an investigation game feels broken.
    */
   _actOn(target) {
+    if (target.kind === 'takedown') {
+      const agent = this.squad?.agents?.find((a) => a.id === target.id) ?? null;
+      this._performTakedown(agent);
+      this._interactLatch = false;
+      return;      // a person is not a landmark: nothing to notify about the place
+    }
     if (target.kind === 'door') {
       this.travelTo(target.id);
       this._interactLatch = false;

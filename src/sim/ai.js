@@ -409,10 +409,18 @@ export class EnemyAgent {
 
     this.body = opts.body instanceof Combatant
       ? opts.body
+      // The bus goes to the body as well as to the agent. Combatant.die() is the one
+      // place every death passes through - a sword, a takedown, a finisher, a fall - and
+      // it emits COMBAT_KILL through _emit(), which does nothing at all without a bus.
+      // Every guard built by makeGuard() had one on the agent and none on the body, so a
+      // guard killed by anything other than resolveMelee() died silently: no HUD, no
+      // music sting, no audio cue, and nothing to tell the two apart from a guard who
+      // was never there.
       : new Combatant({
         id: this.id, side: Side.ENEMY, pos: opts.pos ?? new Vec3(0, 0, 0),
         yaw: Number.isFinite(opts.yaw) ? opts.yaw : 0,
         maxHealth: opts.maxHealth, health: opts.health,
+        bus: this.bus,
       });
     if (!(this.body.pos instanceof Vec3)) this.body.pos = new Vec3(0, 0, 0);
 

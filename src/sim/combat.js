@@ -787,9 +787,12 @@ export function resolveMelee(attacker, defender, swing, opts = {}) {
     if (result.hitstop > 0) {
       bus.emit(Events.COMBAT_HITSTOP, { duration: result.hitstop, kind: profile.kind });
     }
-    if (result.killed) {
-      bus.emit(Events.COMBAT_KILL, { attacker: attacker.id, defender: defender.id, kind: profile.kind });
-    }
+    // COMBAT_KILL is deliberately NOT emitted here. applyDamage() above has already
+    // killed the defender, and Combatant.die() emits it with the attacker as `source` -
+    // one death, one event, whichever way it happened. Emitting a second one from the
+    // resolver would give a sword kill two COMBAT_KILLs and a takedown none, and the
+    // COMBAT_HIT above already carries attacker, defender and kind with `killed: true`
+    // for anything that wanted the detail.
   }
   result.feedback = feedbackFor(result, profile);
   return result;

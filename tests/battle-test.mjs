@@ -42,6 +42,7 @@ import { EventKind, MissionManager, StoryDirector } from '../src/sim/mission.js'
 import { HITSTOP_TIME_SCALE, SwingPhase } from '../src/sim/combat.js';
 import { MISSIONS, CLUE_MAP } from '../src/content/story.js';
 import { LANDMARKS, REGIONS } from '../src/content/world-data.js';
+import { CUES } from '../src/audio/theory.js';
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -422,9 +423,9 @@ describe('battle — a fight is not silent', () => {
     for (let i = 0; i < 240; i++) {
       if (i % 25 === 0) swing(game);
       step(game, 1);
-      if (noises.some((n) => n.source === 'combat-hit')) break;
+      if (noises.some((n) => n.source === 'hit-flesh')) break;
     }
-    const hit = noises.find((n) => n.source === 'combat-hit');
+    const hit = noises.find((n) => n.source === 'hit-flesh');
     assert.ok(hit, 'a sword connecting with a person made no sound at all');
     assert.equal(hit.radius, STEALTH.NOISE_COMBAT_HIT,
       'the noise was not the authored combat radius, so the hearing model and the fight disagree');
@@ -487,6 +488,31 @@ describe('battle — a fight is not silent', () => {
     }
   });
 
+  test('F5 · every noise a fight makes names a sound the catalogue actually has', () => {
+    // NOISE_EMITTED carries `source`, and the audio binding uses it as the cue id,
+    // falling back to 'land-light' for anything the catalogue does not know. A source
+    // string that is not a cue therefore does not fail - it plays a soft landing for a
+    // sword connecting with a person, which is exactly how 'combat-hit' shipped until it
+    // was checked. The hearing model was right and the sound was wrong, and only this
+    // assertion connects the two.
+    const { game, bus } = bootGame();
+    const agent = game.squad.agents[0];
+    const noises = record(bus, Events.NOISE_EMITTED);
+    pin(game, 1.6, agent);
+    killWithTheSword(game, agent);
+
+    const world = noises.filter((n) => n.local === false);
+    assert.gt(world.length, 0, 'a fight and a death made no world noise');
+    const unknown = [...new Set(world.map((n) => n.source))].filter((src) => !CUES[src]);
+    assert.deepEqual(unknown, [],
+      `noise sources with no cue behind them, which fall back to a landing sound: ${unknown.join(', ')}`);
+    // And the sources are the ones the fight means to make, not whatever happened to be
+    // in the catalogue.
+    const sources = new Set(world.map((n) => n.source));
+    assert.ok(sources.has('hit-flesh'), 'a blow landing made no flesh sound');
+    assert.ok(sources.has('body-fall'), 'a body hitting the floor was silent');
+  });
+
   test('F4 · every world noise a fight makes carries a usable source and position', () => {
     // The noise source string is the cue id, which is how one authored value drives both
     // the hearing model and what the player hears. A source the catalogue does not know
@@ -500,7 +526,7 @@ describe('battle — a fight is not silent', () => {
     const world = noises.filter((n) => n.local === false);
     assert.gt(world.length, 0, 'a whole fight and a death produced no world noise');
     const sources = new Set(world.map((n) => n.source));
-    assert.ok(sources.has('combat-hit'), 'a blow connecting never made its noise');
+    assert.ok(sources.has('hit-flesh'), 'a blow connecting never made its noise');
     assert.ok(sources.has('body-fall'), 'a body hitting the floor was silent');
     for (const n of world) {
       assert.ok(n.source && n.source.length > 2, `a noise had no usable source: "${n.source}"`);
@@ -789,8 +815,10 @@ describe('battle — escaping a region while hunted', () => {
  * quietly go stale in the other direction either.
  */
 const PENDING_WIRING = Object.freeze({
-  canTakedown: 'Stealth takedowns: the gates are authored and STEALTH.NOISE_TAKEDOWN exists, but nothing binds an input to them. m04 o5 (optional) waits on it, so it does not block the story.',
-  canFinisher: 'Finishers: the gates are authored and the camera already has a FINISHER mode nothing can reach, because the only way to get a guard into that state is a takedown.',
+  // Empty, and it was not. canTakedown() and canFinisher() both sat here until the
+  // takedown and the execution were wired to the interaction prompt and to the moment a
+  // swing connects. The table stays because the audit that reads it is the thing that
+  // found them: an empty list that can be appended to is worth more than no list.
 });
 
 /**
@@ -801,7 +829,8 @@ const PENDING_WIRING = Object.freeze({
  * objectives look satisfiable while the game could not kill anybody.
  */
 const PENDING_EVENTS = Object.freeze({
-  [EventKind.TAKEDOWN]: 'Waits on canTakedown above. m04 o5 is optional, so it does not block the story.',
+  // Empty. TAKEDOWN was the last kind only the autopilot could produce; it is notified
+  // from play now that a takedown can be performed.
 });
 
 /** Strip comments, so prose mentioning a function is not counted as calling it. */
@@ -899,8 +928,9 @@ describe('battle — is any of it wired up?', () => {
       }
     }
     assert.deepEqual(unaccounted, [], 'combat API that is neither wired nor declared pending');
-    // feedbackFor, isBackstab, blockCovers and withinMeleeReach are all used inside
-    // combat.js by resolveMelee itself, so they are reachable through it.
+    // feedbackFor, isBackstab, blockCovers and withinMeleeReach are used inside
+    // combat.js by resolveMelee itself, so they are reachable through it; canTakedown and
+    // canFinisher are called from main.js.
     assert.deepEqual(stillPending.sort(), Object.keys(PENDING_WIRING).sort(),
       'the pending list and the audit disagree about what is still unwired');
     for (const [name, reason] of Object.entries(PENDING_WIRING)) {
@@ -1305,6 +1335,320 @@ describe('battle — presenting what you carry', () => {
     assert.deepEqual(game.missions.presentAt(HEARTH), []);
     assert.equal(game.missions.problems.length, 0,
       'an ordinary interaction with nothing to present was recorded as a problem');
+  });
+});
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════
+ * M — TAKEDOWNS
+ * ══════════════════════════════════════════════════════════════════════════
+ */
+describe('battle — silencing a guard', () => {
+  /** Hold one agent directly behind the player, at `metres`, facing the same way. */
+  function stalk(game, agent, metres = 1.2) {
+    const update = game.squad.update.bind(game.squad);
+    game.squad.update = (dt) => {
+      update(dt);
+      if (agent.body.isDead) return;
+      const p = game.player.pos;
+      const y = game.player.yaw;
+      agent.body.pos.set(p.x + Math.sin(y) * metres, p.y, p.z + Math.cos(y) * metres);
+      agent.body.yaw = y;      // same facing, so the player is behind him
+    };
+    return agent;
+  }
+
+  /** Press the interaction key the way the player does, and let the frame run. */
+  function interact(game) {
+    game.input.handleEvent('keydown', { code: 'KeyE' });
+    step(game, 1);
+    game.input.handleEvent('keyup', { code: 'KeyE' });
+  }
+
+  test('M1 · creeping up behind a guard who has not seen you offers the takedown', () => {
+    const { game } = bootGame();
+    const agent = stalk(game, game.squad.agents[0]);
+    step(game, 2);
+    assert.equal(game._detectionLevel, 'calm', 'the guard was already alerted, so this is not a stealth case');
+    assert.equal(game._takedownCandidate()?.id, agent.id, 'no takedown was offered');
+    assert.equal(game.prompt?.kind, 'takedown',
+      `the prompt says "${game.prompt?.kind}" where a takedown is available`);
+    assert.equal(game.prompt?.action, 'حيّد',
+      'the prompt has no Arabic verb, so an Arabic player is offered nothing to press');
+    assert.equal(game.prompt?.id, agent.id, 'the prompt is aimed at the wrong guard');
+  });
+
+  test('M2 · taking the guard down kills him quietly and tells the mission system', () => {
+    const { game, bus } = bootGame();
+    const agent = stalk(game, game.squad.agents[0]);
+    const others = game.squad.agents.filter((a) => a !== agent);
+    assert.gt(others.length, 0, 'this needs a second guard to hear nothing');
+    const kills = record(bus, Events.COMBAT_KILL);
+    const takedowns = [];
+    const forward = game.missions.notify.bind(game.missions);
+    game.missions.notify = (e) => {
+      if (e?.kind === EventKind.TAKEDOWN || e?.kind === EventKind.KILL) takedowns.push(e.kind);
+      return forward(e);
+    };
+    step(game, 2);
+    interact(game);
+
+    assert.ok(agent.body.isDead, 'the interaction did not take the guard down');
+    assert.equal(kills.length, 1, `a takedown emitted ${kills.length} COMBAT_KILL events`);
+    assert.equal(kills[0].source, 'takedown',
+      'a silent removal is indistinguishable from a sword kill on the bus');
+    assert.deepEqual(takedowns, [EventKind.TAKEDOWN],
+      `a takedown notified ${JSON.stringify(takedowns)}; it must count as a takedown and not as a kill`);
+  });
+
+  test('M3 · a takedown is quiet by exactly the authored amount', () => {
+    // NOISE_TAKEDOWN is 6.5m against NOISE_COMBAT_HIT's 22m. That difference is the whole
+    // reward for stealth, and it is one number: get it wrong and either nobody ever hears
+    // a body drop or a takedown is a gunshot.
+    const { game, bus } = bootGame();
+    const agent = stalk(game, game.squad.agents[0]);
+    const others = game.squad.agents.filter((a) => a !== agent);
+    const noises = record(bus, Events.NOISE_EMITTED);
+    step(game, 2);
+    interact(game);
+    assert.ok(agent.body.isDead, 'nothing happened, so there is no noise to measure');
+
+    const sound = noises.find((n) => n.source === 'takedown');
+    assert.ok(sound, 'a takedown made no sound at all');
+    assert.equal(sound.radius, STEALTH.NOISE_TAKEDOWN,
+      'the takedown was not as quiet as the constants author');
+    assert.equal(sound.local, false, 'the takedown was reported as the player being loud');
+    assert.notOk(noises.some((n) => n.source === 'hit-flesh'),
+      'a silent removal rang out like a sword fight');
+
+    // And the guards standing further than 6.5m carried on as though nothing happened,
+    // which is what makes the number worth authoring.
+    for (const other of others) {
+      other.body.pos.set(agent.body.pos.x + STEALTH.NOISE_TAKEDOWN * 4, agent.body.pos.y, agent.body.pos.z);
+    }
+    step(game, 20);
+    for (const other of others) {
+      assert.lt(other.suspicion, STEALTH.SUSPICION_COMBAT_THRESHOLD,
+        `${other.id} was alarmed by a takedown four times outside its radius`);
+    }
+  });
+
+  test('M4 · a guard who has seen you cannot be taken down', () => {
+    // STEALTH.TAKEDOWN_REQUIRES_UNDETECTED is honoured inside canTakedown() rather than
+    // left to the call site, because a rule that depends on every caller remembering it is
+    // a rule that will be forgotten. This proves the runtime passes the fact in.
+    const { game } = bootGame();
+    const agent = stalk(game, game.squad.agents[0]);
+    alarm(game, agent, 16);
+    stalk(game, agent);          // alarm() stepped; take the position back
+    step(game, 2);
+    assert.equal(game._detectionLevel, 'combat', 'the guard is not detected, so this proves nothing');
+    assert.equal(game._takedownCandidate()?.id ?? null, null, 'a guard in open combat can be silently taken down');
+    assert.notEqual(game.prompt?.kind, 'takedown', 'the prompt offered a takedown in a firefight');
+    assert.notOk(game._performTakedown(agent), 'the act itself went through while detected');
+    assert.notOk(agent.body.isDead, 'a detected guard was killed by a takedown');
+  });
+
+  test('M5 · the takedown commits the player for its authored duration', () => {
+    // TAKEDOWN_DURATION spent through the attack lock is what makes creeping up behind a
+    // guard a decision: for that second and a bit the player cannot swing or dodge out of
+    // it, so being caught mid-takedown is a real risk rather than a free hit.
+    const { game } = bootGame();
+    const agent = stalk(game, game.squad.agents[0]);
+    step(game, 2);
+    assert.ok(game._performTakedown(agent), 'the takedown did not happen');
+    assert.close(game.player.attackLock, STEALTH.TAKEDOWN_DURATION, 17 / 1000,
+      'the takedown did not commit the player for the authored duration');
+    game.input.pressAction('dodge');
+    step(game, 1);
+    assert.notEqual(game.player.state, 'dodge', 'the player dodged out of his own takedown');
+    assert.gt(game.hitstop, 0, 'a body going down froze nothing');
+  });
+
+  test('M6 · a takedown is offered before the world, and only for a live guard', () => {
+    const { game } = bootGame();
+    const agent = stalk(game, game.squad.agents[0]);
+    step(game, 2);
+    assert.equal(game.prompt?.kind, 'takedown', 'the takedown lost the prompt to the scenery');
+
+    agent.onDeath('test');
+    step(game, 2);
+    assert.notEqual(game.prompt?.kind, 'takedown', 'a corpse can be taken down');
+    assert.equal(game._takedownCandidate()?.id ?? null, null, 'a corpse was returned as a candidate');
+    assert.notOk(game._performTakedown(agent), 'the act went through on a corpse');
+  });
+});
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════
+ * N — THE EXECUTION
+ * ══════════════════════════════════════════════════════════════════════════
+ */
+describe('battle — finishing a guard who is nearly dead', () => {
+  /** Hold one agent in front of the player at sword range, and face him. */
+  function atSwordsPoint(game, agent, metres = 1.2) {
+    const update = game.squad.update.bind(game.squad);
+    game.squad.update = (dt) => {
+      update(dt);
+      if (agent.body.isDead) return;
+      const p = game.player.pos;
+      const y = game.player.yaw;
+      agent.body.pos.set(p.x + Math.sin(y) * metres, p.y, p.z + Math.cos(y) * metres);
+      agent.body.yaw = y + Math.PI;
+    };
+    return agent;
+  }
+
+  /** Wound a guard to inside the finisher threshold without killing him. */
+  function wound(agent) {
+    agent.body.health = agent.body.maxHealth * (COMBAT.FINISHER_HEALTH_THRESHOLD * 0.5);
+    agent.body.hitIframes = 0;
+    return agent;
+  }
+
+  /** Swing until something happens, facing the target every frame. */
+  function swingAt(game, agent, maxFrames = 60) {
+    for (let i = 0; i < maxFrames; i++) {
+      game.player.yaw = Math.atan2(
+        agent.body.pos.x - game.player.pos.x,
+        agent.body.pos.z - game.player.pos.z,
+      );
+      if (i % 20 === 0) swing(game);
+      step(game, 1);
+      if (agent.body.isDead || game.player.state === 'finisher') return true;
+    }
+    return agent.body.isDead;
+  }
+
+  test('N1 · a swing that connects with a dying guard is an execution, not another hit', () => {
+    const { game, bus } = bootGame();
+    const agent = wound(atSwordsPoint(game, game.squad.agents[0]));
+    const kills = record(bus, Events.COMBAT_KILL);
+    const takedowns = [];
+    const forward = game.missions.notify.bind(game.missions);
+    game.missions.notify = (e) => {
+      if (e?.kind === EventKind.KILL) takedowns.push(e);
+      return forward(e);
+    };
+
+    assert.ok(swingAt(game, agent), 'the guard was not killed at all');
+    assert.ok(agent.body.isDead, 'the guard survived an execution');
+    assert.equal(kills.length, 1, `an execution emitted ${kills.length} COMBAT_KILL events`);
+    assert.equal(kills[0].source, 'finisher', 'the death does not say how it happened');
+    assert.equal(takedowns.length, 1, `an execution reached the mission system ${takedowns.length} times`);
+    assert.equal(takedowns[0].kind, EventKind.KILL,
+      'an execution in a fight did not count as a kill, so a COMBAT objective would not move');
+  });
+
+  test('N2 · the execution takes the player out of the fight for its authored duration', () => {
+    // FINISHER_INVULN is the whole bargain: the player commits to 2.6 seconds of
+    // animation and cannot be hurt during it. Either half missing breaks it - no
+    // invulnerability and an execution is suicide in a group fight, no commitment and it
+    // is a free instant kill.
+    const { game } = bootGame();
+    const agent = wound(atSwordsPoint(game, game.squad.agents[0]));
+    assert.ok(swingAt(game, agent), 'the execution did not happen');
+    assert.equal(game.player.state, 'finisher', 'the player is not in the finisher state');
+    assert.equal(game.player.invulnerableReason, 'finisher-invuln',
+      'the execution left the player vulnerable');
+
+    // Measured in world time, which is what _updateFinisher counts. The impact freeze
+    // that opens the act scales the world, so the real time is slightly longer - and
+    // asserting on real time here would be asserting on the hitstop instead.
+    let frames = 0;
+    let peak = 0;
+    while (game.player.state === 'finisher' && frames < 60 * 8) {
+      step(game, 1);
+      frames++;
+      // Tracked as a peak because _updateFinisher() resets finisherTime to zero on the
+      // frame the act ends, so reading it afterwards always reads nothing.
+      peak = Math.max(peak, game.player.finisherTime ?? 0);
+    }
+    assert.notEqual(game.player.state, 'finisher', 'the execution never ended');
+    assert.gte(peak + (17 / 1000), COMBAT.FINISHER_DURATION,
+      `the execution ended after ${peak}s of world time, short of ${COMBAT.FINISHER_DURATION}`);
+    assert.lt(peak, COMBAT.FINISHER_DURATION + 0.2,
+      `the execution ran to ${peak}s, long past its authored ${COMBAT.FINISHER_DURATION}`);
+    assert.equal(game._finisherVictim, null, 'the camera kept a victim after the act was over');
+  });
+
+  test('N3 · the camera frames the pair, and never emits a broken position', () => {
+    // The FINISHER camera mode was written, tested and unreachable: _inferMode() keys on
+    // ctx.finisher and nothing ever put a victim in it. This is the assertion that it is
+    // now fed, and that it is fed something the solver can use.
+    const { game } = bootGame();
+    const agent = wound(atSwordsPoint(game, game.squad.agents[0]));
+    assert.ok(swingAt(game, agent), 'the execution did not happen');
+    const shot = game._finisherShot();
+    assert.ok(shot, 'the camera was given no finisher to frame');
+    assert.equal(shot.victim?.id, agent.id, 'the camera was given the wrong victim');
+    assert.equal(shot.duration, COMBAT.FINISHER_DURATION,
+      'the shot outlives or cuts short the act it is framing');
+
+    // One frame for the camera to take the mode, then hold it through the whole act.
+    let sawFinisherMode = false;
+    for (let i = 0; i < 60 * 4 && game.player.state === 'finisher'; i++) {
+      step(game, 1);
+      if (game.camera.mode === 'finisher') sawFinisherMode = true;
+      const pos = game.camera.position;
+      assert.ok(Number.isFinite(pos.x) && Number.isFinite(pos.y) && Number.isFinite(pos.z),
+        `the execution camera emitted a non-finite position at frame ${i}`);
+      assert.ok(Number.isFinite(game.camera.fov), 'the execution camera emitted a non-finite fov');
+    }
+    assert.ok(sawFinisherMode,
+      'the camera never took FINISHER mode during an execution, so the shot is still unreachable');
+  });
+
+  test('N4 · a healthy guard is hit, not executed', () => {
+    // FINISHER_HEALTH_THRESHOLD is 0.16. If the gate were ignored, every connecting swing
+    // would be a 2.6 second invulnerable animation and combat would be over.
+    const { game } = bootGame();
+    const agent = atSwordsPoint(game, game.squad.agents[0]);
+    assert.equal(agent.body.health, agent.body.maxHealth, 'the guard started wounded');
+    const before = agent.body.health;
+    // Kept alive and swinging until a blow lands: the guard is fighting back too, and a
+    // stagger cancels the player's swing, so this takes more than one attempt.
+    let landed = false;
+    for (let i = 0; i < 400 && !landed; i++) {
+      game.player.health = 100;
+      game.player.yaw = Math.atan2(
+        agent.body.pos.x - game.player.pos.x,
+        agent.body.pos.z - game.player.pos.z,
+      );
+      if (i % 20 === 0) swing(game);
+      step(game, 1);
+      landed = agent.body.health < before;
+      assert.notEqual(game.player.state, 'finisher',
+        'a guard at full health was executed, so FINISHER_HEALTH_THRESHOLD is being ignored');
+    }
+    assert.ok(landed, 'no blow landed on a healthy guard in four hundred frames');
+    assert.notOk(agent.body.isDead, 'a guard at full health died to one light attack');
+  });
+
+  test('N5 · one swing executes once, however many frames the act spans', () => {
+    const { game, bus } = bootGame();
+    const agent = wound(atSwordsPoint(game, game.squad.agents[0]));
+    const kills = record(bus, Events.COMBAT_KILL);
+    assert.ok(swingAt(game, agent), 'the execution did not happen');
+    for (let i = 0; i < 60; i++) step(game, 1);
+    assert.equal(kills.length, 1,
+      `${kills.length} COMBAT_KILL events came out of one execution`);
+  });
+
+  test('N6 · an execution is loud, because it happens in the open', () => {
+    // The opposite of the takedown, on purpose: this is a public killing in the middle of
+    // a fight, and it must carry the combat radius or the guards next to it keep swinging
+    // at a player who just executed their friend.
+    const { game, bus } = bootGame();
+    const agent = wound(atSwordsPoint(game, game.squad.agents[0]));
+    const noises = record(bus, Events.NOISE_EMITTED);
+    assert.ok(swingAt(game, agent), 'the execution did not happen');
+    const sources = new Set(noises.filter((n) => n.local === false).map((n) => n.source));
+    assert.ok(sources.has('hit-flesh'), 'an execution was quieter than a sword hit');
+    assert.ok(sources.has('body-fall'), 'an executed body made no sound hitting the floor');
+    const loud = noises.find((n) => n.source === 'hit-flesh');
+    assert.equal(loud.radius, STEALTH.NOISE_COMBAT_HIT,
+      'the execution was not as loud as the constants author');
   });
 });
 
