@@ -1,14 +1,21 @@
 # MASTER DEVELOPMENT ROADMAP
 ## Agent 01 (CEO) — Issued 2026-09-12
 
-**Gate status:** ⛔ **BLOCKED.** This roadmap is issued in structure only. No
-phase may begin execution until the P0 blocker in `00_CEO_AUDIT_FINDING.md` is
-resolved by owner decision (PATH 1 / 2 / 3).
+**Gate status:** ✅ **RESOLVED — PATH 2.** The owner selected the authorised
+ground-up build, which overrides brief §0 ("DO NOT REBUILD THE GAME FROM SCRATCH").
+§0 was unsatisfiable in any case: `00_CEO_AUDIT_FINDING.md` establishes that the
+repository contained one 20-byte `README.md`, so there was nothing to preserve.
+Phases A–L are unblocked and in execution.
 
-**Why gated:** §38 requires the CEO to consolidate real specialist audits into a
-roadmap. With an empty repository there is nothing for Agents 02–18 to audit, so
-any phase sequencing produced now would be speculation, not evidence — violating
-C-1.
+**Achieved state is recorded in `03_PHASE_LEDGER.md`,** which exists because this
+document describes intended order and has nowhere to put it. Every entry there carries
+the command that reproduces it, per C-1.
+
+**Why it was gated:** §38 requires the CEO to consolidate real specialist audits into a
+roadmap. With an empty repository there was nothing for Agents 02–18 to audit, so any
+phase sequencing produced then would have been speculation, not evidence — violating
+C-1. That condition no longer holds: the repository now builds, and the audits are being
+filed as phases close rather than all up front.
 
 ---
 
@@ -79,14 +86,19 @@ verified before modification, per instruction "Do not assume they are already
 fixed." C-11 applies in full: working systems are preserved. Phase order is then
 re-derived from measured defect density.
 
-### PATH 2 — authorised ground-up build
+### PATH 2 — authorised ground-up build ← **SELECTED**
 Phase 0 expands into a **construction programme** and the §31 phases become build
-targets rather than improvement targets. Mandatory additions:
+targets rather than improvement targets. The owner additionally set the evidence
+standard: the §10 figures (49 files / ~13,251 lines / the named suite scores) are
+**targets to genuinely reach**, not claims to repeat, and no score is reported unless
+the suite executes and passes under a command given alongside it. Mandatory additions:
 - **0.2a** Harness-first: `run.sh` + 7 suites exist *before* gameplay code, so
-  every later claim is evidence-backed (C-1).
+  every later claim is evidence-backed (C-1). — ✅ closed; 12 suites, 648 tests.
 - **0.2b** Architecture lock: Three.js r186, ES modules, zero external runtime
   dependency, fully procedural assets (§8) — approved by CEO before Phase A.
+  — ✅ closed; `lint.sh` enforces the import graph and the audio system fetches nothing.
 - Canon lock enforced from the first line of story data (§4–§7, charter §10).
+  — ✅ closed and enforced by `lint.sh`, which fails on a prohibited name.
 - Realistic expectation set with owner: ~13,000 lines across ~49 files, 22
   character models, 14 dialogue trees, 9 cinematics is a multi-cycle programme,
   not a single pass. C-8 still forbids bloat.
