@@ -68,10 +68,10 @@ Every number below is the suite's own reported score, from
 | reach-test.mjs | 22/22 PASS | `node tests/reach-test.mjs` |
 | runtime-test.mjs | 98/98 PASS | `node tests/runtime-test.mjs` |
 | playthrough.mjs | 14/14 PASS | `node tests/playthrough.mjs` |
-| battle-test.mjs | 38/38 PASS | `node tests/battle-test.mjs` |
+| battle-test.mjs | 45/45 PASS | `node tests/battle-test.mjs` |
 | cinematic-test.mjs | 35/35 PASS | `node tests/cinematic-test.mjs` |
 | audio-test.mjs | 62/62 PASS | `node tests/audio-test.mjs` |
-| **TOTAL** | **686/686 PASS** | `bash run.sh` |
+| **TOTAL** | **693/693 PASS** | `bash run.sh` |
 
 `battle-test.mjs` is a **required** suite, not an additional one. It is the only gate
 that drives combat through the real frame loop; the two suites that already covered
@@ -136,14 +136,14 @@ Status is the exit gate, not the existence of code.
 | **A** AI and enemy behaviour | AI never cheats; perception, memory, flanking, retreat verified | 🟢 SUBSTANTIALLY MET | `ai-test` 79/79. Perception truth carries the real noise radius (`main.js._buildTruth`); hearing verified end to end by runtime-test IX6/IX7. The AI reads only `truth`, never player state. |
 | **B** Input / gamepad | full gamepad navigation; no lag, sliding or unwanted drift | 🟢 SUBSTANTIALLY MET | `input-test` 57/57; runtime VIII2–VIII4 cover the touch surface. Gamepad poller wired in `core/input.js`. |
 | **C** Real bow / projectile | bow fires a true projectile — travel, drop, impact | 🔴 **NOT BUILT** | `PROJ` constants exist and are referenced by nothing: `grep -rn "PROJ\." src/` returns no hits. `main.js` tracks `aiming` / `drawing` intent with no system consuming it. Three audio cues are marked pending on this. |
-| **D** Finisher & contextual combat camera | zero geometry penetration; no violent snap | 🟡 PARTIAL | `camera-test` 40/40, `cinematic-test` 35/35, `battle-test` 38/38. Melee, blocking, parry, dodging, lock-on and hitstop are all reachable in play and gated. **The finisher is not**: `canFinisher()` has no call site and `PlayerState.FINISHER` cannot be entered, because the only route into it is a takedown and `canTakedown()` has no call site either. Downgraded from 🟢 by battle-test J2, which audits exactly this. |
+| **D** Finisher & contextual combat camera | zero geometry penetration; no violent snap | 🟡 PARTIAL | `camera-test` 40/40, `cinematic-test` 35/35, `battle-test` 45/45. Melee, blocking, parry, dodging, lock-on and hitstop are all reachable in play and gated. **The finisher is not**: `canFinisher()` has no call site and `PlayerState.FINISHER` cannot be entered, because the only route into it is a takedown and `canTakedown()` has no call site either. Downgraded from 🟢 by battle-test J2, which audits exactly this. |
 | **E** Fall / ledge systems | fall damage and ledge grab functional; vertical traversal tested | 🟢 SUBSTANTIALLY MET | `movement-test` 38/38. `PLAYER_LANDED`, `PLAYER_LEDGE_GRAB`, authored light/heavy landing noise split at `FALL_DAMAGE_SAFE_HEIGHT`. |
 | **F** Character visual quality | distinct faces and silhouettes; historical clothing; no placeholders | 🟡 PARTIAL | `render/characters.js` builds a proportioned rig with beard, silhouette and stride. **Not screenshot-verified**, which the gate requires. The brief's 22 distinct models are not built; the rig is parameterised over the cast. |
 | **G** World visual & historical authenticity | dense, purposeful, believable; no European/Gothic/modern elements | 🟡 PARTIAL | 20 regions, 142 landmarks, 26 materials. Historical vocabulary gate passes in `lint.sh`. Visual density is not independently reviewed. |
-| **H** Mission / story polish | all chapters, missions, trees, clues and cinematics completable | 🟡 PARTIAL | `playthrough` 14/14, `cinematic-test` 35/35, `battle-test` 38/38. All §4 content counts reached; objectives defer completion until a cinematic has actually run. **One required objective is still not completable from play** — m11/o5, the last objective of the last mission. `playthrough` passes because its StoryDirector synthesises the event; battle-test J3/J4 name the gap instead of hiding it. Downgraded from 🟢. |
+| **H** Mission / story polish | all chapters, missions, trees, clues and cinematics completable | 🟢 SUBSTANTIALLY MET | `playthrough` 14/14, `cinematic-test` 35/35, `battle-test` 45/45. All §4 content counts reached; objectives defer completion until a cinematic has actually run. **Every required objective in the story is now satisfiable from play** — battle-test J4 asserts an empty blocked list and counts the six event-driven objectives it is checking. Was 🟡 for one commit while m11/o5 was open; see §7. |
 | **I** UI / UX / audio / localisation | Arabic complete and RTL correct; instant switching; no major missing audio; music transitions | 🟢 SUBSTANTIALLY MET | Arabic is the default and RTL-first. Language switching is instant and re-renders every `data-i18n` node. **Audio closed 2026-09-13** — see §6. runtime VIII10 now proves every key exists in both languages. |
 | **J** Performance | §24 ledger within budget; every optimisation reports BEFORE/AFTER/CHANGE %/QUALITY IMPACT | 🟡 PARTIAL | Per-frame telemetry is measured and exposed. No optimisation has yet been performed, so no BEFORE/AFTER rows exist to report. |
-| **K** Full QA | all regression suites pass; Level 3 playthrough; §25 reliability matrix | 🟡 PARTIAL | 686/686 across 13 suites. The §25 reliability matrix is not yet written. |
+| **K** Full QA | all regression suites pass; Level 3 playthrough; §25 reliability matrix | 🟡 PARTIAL | 693/693 across 13 suites. The §25 reliability matrix is not yet written. |
 | **L** Release preparation | §36 Final Release Gate — all ten blocks green | 🔴 NOT STARTED | Certifies a frozen build. C and F are open. |
 
 Standing: **Agent 16 (save / reliability)** runs continuously, not as a phase. Save and
@@ -224,7 +224,34 @@ both would make every agent in the region hear one sword hit twice and raise sus
 twice as fast as authored, which is the AI cheating by double-counting. And hitstop
 scales the world but not its own timer, for the reason in the table.
 
-`battle-test.mjs` (38 tests, 6 groups) was written against this. Group E drives a booted
+### 7.1 The last objective, closed the same day
+
+The combat P0 exposed a second gap of the same shape: `EventKind.RETURN` was only ever
+produced by `StoryDirector`, so **m11/o5 — "read the true will aloud", the last required
+objective of the last mission — could not be completed by playing.** `playthrough` passed
+throughout, because the director synthesises the events it needs.
+
+RETURN is the one objective type whose target is a thing the player carries rather than a
+place, so the place has to come from somewhere else, and hardcoding "at Layla's hearth"
+would put m11 in the code. It is derived instead: `MissionManager#presentationPlace()`
+walks back through the mission's own objectives to the nearest preceding **required** beat
+that names a landmark, and `DIALOGUE_MAP` already records which landmark each tree is
+staged at. For m11 that is o4, the hearth conversation, so the reading resolves to
+`lm-ll-hearth` from authored data. Nothing in `mission.js` knows m11 exists.
+
+Three rules make it a scene rather than a loophole, each with a test that fails without
+it: the beat the place came from must be **complete** (the reading follows the
+conversation, L4); the player must be **carrying** the document (L5); and the landmark
+must be **that** one (L3 — the loom, the table and the chest in the same room offer
+nothing).
+
+`presentationAt()` is public because the prompt needs it. A hearth that keeps saying
+"Talk" after the conversation is over is a hearth nobody reads at, so the verb becomes
+"اقرأ جهارًا / Read aloud" — which exposed a third defect: `_publishPrompt()` compared
+only `id` and `kind`, so a verb change at the same landmark was swallowed and the HUD
+would have kept the stale text forever (L6).
+
+`battle-test.mjs` (45 tests, 7 groups) was written against this. Group E drives a booted
 `Game` and a real button press rather than calling the resolver — the only form of the
 test that could have caught the bug. Group J generalises it: every combat export and
 every mission event kind must have a call site in `src/`, or be named in a pending list
@@ -241,7 +268,7 @@ The combat P0 that headed this list is closed — see §7.
 
 | # | Priority | Item | Why it blocks |
 |---|---|---|---|
-| 1 | **P0** | m11/o5 — the last objective of the last mission cannot be completed from play | `ObjectiveType.RETURN` targets a clue id (`clue-temple-archive`) and nothing notifies `EventKind.RETURN`. `notify()` matches *every* incomplete objective rather than only the next, so the obvious rule — interacting anywhere while holding the clue — would complete "read the true will aloud at Layla's hearth" in the temple archive. It needs a place condition, and inventing one silently would be worse than leaving it named. Tracked by battle-test J4, which asserts this is the *only* such objective and fails if a second appears. |
+| 1 | ~~**P0**~~ | ~~m11/o5 — the last objective of the last mission cannot be completed from play~~ | **CLOSED 2026-09-13**, see §7.1. battle-test J4 now asserts the blocked list is *empty*, so a second objective of this kind fails the baseline instead of being discovered by a player. |
 | 2 | **P1** | Takedowns and finishers have no input path | `canTakedown()` and `canFinisher()` are authored and have no call site; `PlayerState.FINISHER` and the camera's FINISHER mode are unreachable. m04/o5 (optional) waits on the takedown. One audio cue waits on it. Tracked by battle-test J2. |
 | 3 | **P1** | Phase C — no bow or projectile system | The gate requires a true projectile, not long-reach melee. `aiming` and `drawing` intent are sampled every frame and consumed by nothing, so the player can hold a button that does nothing. Three authored audio cues wait on it. |
 | 4 | **P1** | Phase F — no visual verification | The gate requires screenshot verification and distinct faces. Nothing has been looked at. A rig that is correct in arithmetic and wrong on screen passes every suite written so far. |

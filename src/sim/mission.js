@@ -335,6 +335,78 @@ export class MissionManager {
     return this.state.objectiveProgress(missionId, objectiveId);
   }
 
+  /* ------------------------------------------------------- presenting an item */
+
+  /**
+   * Where a RETURN objective is meant to happen.
+   *
+   * RETURN is the one objective type whose target is a thing the player carries rather
+   * than a place, so the place has to come from somewhere else - and inventing one per
+   * mission is how content and code drift apart. It comes from the story instead: the
+   * nearest preceding required objective that names a landmark is the beat the player
+   * was just sent to, and reading a document aloud happens there.
+   *
+   * For m11/o5 that is o4, the dialogue at Layla's hearth, and DIALOGUE_MAP carries the
+   * landmark the tree is staged at - so "read the true will aloud" resolves to
+   * lm-ll-hearth from authored data, with nothing about m11 written here.
+   *
+   * Requiring that beat to be complete is what puts the reading after the conversation
+   * rather than during it. Optional objectives are skipped: a player who walked past one
+   * must not find the story locked behind a scene they were never asked to see.
+   *
+   * @returns {string|null} landmark id, or null when no place can be derived
+   */
+  #presentationPlace(mission, objective) {
+    const index = mission.objectives.indexOf(objective);
+    let fallback = null;
+    for (let i = index - 1; i >= 0; i--) {
+      const o = mission.objectives[i];
+      if (!o.target) continue;
+      const landmark = o.type === ObjectiveType.DIALOGUE
+        ? DIALOGUE_MAP[o.target]?.landmark ?? null
+        : (LANDMARK_MAP[o.target] ? o.target : null);
+      if (!landmark) continue;
+      if (!fallback) fallback = landmark;
+      if (o.optional) continue;
+      return this.state.isObjectiveDone(mission.id, o.id) ? landmark : null;
+    }
+    return fallback;
+  }
+
+  /**
+   * The RETURN objective the player could complete by presenting at this landmark, or
+   * null. Public because the interaction prompt has to offer the right verb: without it
+   * the hearth keeps saying "Talk" after the conversation is over, and reading the will
+   * aloud is something no player would think to try.
+   */
+  presentationAt(landmarkId) {
+    if (!landmarkId || !LANDMARK_MAP[landmarkId]) return null;
+    for (const mission of this.activeMissions()) {
+      for (const o of mission.objectives) {
+        if (o.type !== ObjectiveType.RETURN) continue;
+        if (this.state.isObjectiveDone(mission.id, o.id)) continue;
+        if (!this.state.hasClue(o.target)) continue;
+        if (this.#presentationPlace(mission, o) === landmarkId) {
+          return { missionId: mission.id, objectiveId: o.id, item: o.target };
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Present what the player is carrying at the landmark they are standing at.
+   *
+   * Called on every landmark interaction; it decides whether any of them is a RETURN.
+   * The notification goes through notify() like every other event, so the matcher, the
+   * progress counter and the completion beat are all the ordinary ones.
+   */
+  presentAt(landmarkId) {
+    const pending = this.presentationAt(landmarkId);
+    if (!pending) return [];
+    return this.notify({ kind: EventKind.RETURN, id: pending.item });
+  }
+
   /** Localized text for one objective, for the tracker UI. */
   objectiveView(missionId, objectiveId) {
     const m = MISSION_MAP[missionId];

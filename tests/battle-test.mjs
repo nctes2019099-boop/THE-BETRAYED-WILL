@@ -96,6 +96,9 @@ function swing(game) { assert.ok(game.input.pressAction('attackLight'), 'the att
 /** Lock on. Also an edge action, so it is pressed rather than held. */
 function lock(game) { assert.ok(game.input.pressAction('lockOn'), 'the lock press was refused'); }
 
+/** The bus a booted game publishes on. */
+function busOf(game) { return game.bus; }
+
 /** A bus recorder for one event name. */
 function record(bus, name) {
   const log = [];
@@ -798,7 +801,6 @@ const PENDING_WIRING = Object.freeze({
  * objectives look satisfiable while the game could not kill anybody.
  */
 const PENDING_EVENTS = Object.freeze({
-  [EventKind.RETURN]: "m11 o5 'read the true will aloud' targets a clue id. notify() matches every incomplete objective rather than only the next, so a generic rule would complete it wherever the clue happens to be held rather than at Layla's hearth. It needs a place condition before it can be wired honestly.",
   [EventKind.TAKEDOWN]: 'Waits on canTakedown above. m04 o5 is optional, so it does not block the story.',
 });
 
@@ -955,13 +957,24 @@ describe('battle — is any of it wired up?', () => {
         if (PENDING_EVENTS[kind]) blocked.push(`${mission.id}/${o.id} (${o.type})`);
       }
     }
-    // A known, named gap rather than a surprise: m11 o5 cannot be completed from play
-    // yet. Asserting it is exactly one objective keeps the ledger honest and fails the
-    // moment a second one appears, or the first is fixed without the list being updated.
-    assert.equal(blocked.length, 1,
+    // Nothing. This assertion used to read `blocked.length === 1` and name m11/o5, the
+    // last objective of the last mission, as a known gap. It is empty now, and an empty
+    // list is the only acceptable answer: every required objective in the story is
+    // satisfiable by playing it.
+    assert.deepEqual(blocked, [],
       `required objectives play cannot satisfy: ${blocked.join(' | ')}`);
-    assert.equal(blocked[0], 'm11-betrayed-will/o5 (return)',
-      `the one known blocked objective changed: ${blocked[0]}`);
+    // And the check still has something to check, or it passes by finding no objectives.
+    let eventDriven = 0;
+    for (const mission of MISSIONS) {
+      for (const o of mission.objectives) {
+        if (!o.optional && KIND_FOR_TYPE[o.type]) eventDriven++;
+      }
+    }
+    // Six, counted from the content: three COMBAT (m06/o5, m10/o3, m11/o2), two ESCAPE
+    // (m07/o1, m07/o3) and one RETURN (m11/o5). Exactly the six that were unsatisfiable
+    // when nothing in play produced their events.
+    assert.equal(eventDriven, 6,
+      `the story has ${eventDriven} required event-driven objectives, expected 6`);
   });
 
   test('J5 · every combat event the page listens for has an emitter', () => {
@@ -1111,6 +1124,187 @@ describe('battle — the fight does not break anything else', () => {
     assert.doesNotThrow(() => game.missions.notify(null));
     assert.doesNotThrow(() => game.missions.notify({}));
     assert.ok(game.missions instanceof MissionManager);
+  });
+});
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════
+ * L — READING THE WILL ALOUD
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * m11/o5 is the last required objective of the last mission, and it is the one place in
+ * the story where the player has to present something they are carrying rather than go
+ * somewhere or kill someone. RETURN targets a clue id, so the place has to come from
+ * somewhere else - and the temptation is to hardcode "at Layla's hearth".
+ *
+ * It does not. `#presentationPlace()` walks back through the mission's own objectives to
+ * the nearest preceding required beat that names a landmark, and DIALOGUE_MAP already
+ * records which landmark each tree is staged at. For m11 that is o4, the hearth
+ * conversation, so the place resolves to lm-ll-hearth from authored data. Nothing in the
+ * code knows m11 exists.
+ */
+describe('battle — presenting what you carry', () => {
+  const M11 = 'm11-betrayed-will';
+  const HEARTH = 'lm-ll-hearth';
+  const WILL = 'clue-temple-archive';
+
+  /**
+   * Walk the whole story to m11 with everything before o5 done and o5 itself untouched.
+   *
+   * The director can satisfy o5 on its own, so the walk has to stop the moment o5 is the
+   * pending objective rather than run to the end. `#nextObjective()` takes them in order,
+   * so "every objective before it is complete" is exactly that moment.
+   */
+  function reachTheHearth() {
+    const { game, bus } = bootGame();
+    const mission = MISSIONS.find((m) => m.id === M11);
+    const objective = mission.objectives.find((o) => o.id === 'o5');
+    const prior = mission.objectives.slice(0, mission.objectives.indexOf(objective));
+    const director = new StoryDirector({ bus, manager: game.missions });
+    const ready = () => game.missions.currentMission()?.id === M11
+      && prior.every((o) => game.missions.state.isObjectiveDone(M11, o.id));
+    director.begin();
+    let guard = 0;
+    while (!ready() && guard++ < 600) {
+      const beat = director.step();
+      if (beat.type === 'finished' || beat.type === 'stuck') break;
+    }
+    assert.ok(ready(),
+      `the story never reached its last objective (${director.stuckReason ?? `${guard} steps`})`);
+    assert.notOk(game.missions.state.isObjectiveDone(M11, objective.id),
+      'the director satisfied the last objective on the way, so play is not what is measured');
+    return { game, bus, mission, objective, director };
+  }
+
+  /** m11 active, the will held, and one named objective left undone. */
+  function stageTheHearth({ conversationDone }) {
+    const { game } = bootGame();
+    const mission = MISSIONS.find((m) => m.id === M11);
+    game.missions.state.chapterId = mission.chapter;
+    game.missions.state.addActiveMission(M11);
+    game.missions.state.grantClue(WILL);
+    if (conversationDone) game.missions.notify({ kind: EventKind.DIALOGUE, id: 'dt-ll-hearth' });
+    return { game, mission, objective: mission.objectives.find((o) => o.id === 'o5') };
+  }
+
+  test('L1 · the story arrives at its last objective with the will in the player\'s hands', () => {
+    const { game, objective } = reachTheHearth();
+    assert.ok(game.missions.state.hasClue(WILL),
+      'the story reached the reading without ever giving the player the document to read');
+    assert.notOk(game.missions.state.isObjectiveDone(M11, objective.id),
+      'the last objective was already complete on arrival, so the player has nothing to do');
+    assert.deepEqual(game.missions.presentationAt(HEARTH),
+      { missionId: M11, objectiveId: objective.id, item: WILL },
+      'the hearth does not offer the reading');
+  });
+
+  test('L2 · reading aloud at the hearth completes the last mission', () => {
+    const { game, objective } = reachTheHearth();
+    const completed = game.missions.presentAt(HEARTH);
+    assert.equal(completed.length, 1, `presenting at the hearth completed ${completed.length} objectives`);
+    assert.ok(game.missions.state.isObjectiveDone(M11, objective.id),
+      'the reading did not complete the objective it exists to complete');
+    assert.equal(game.missions.objectiveProgress(M11, objective.id), 1);
+    const left = game.missions.currentMission()?.objectives
+      .filter((o) => !o.optional && !game.missions.state.isObjectiveDone(M11, o.id)) ?? [];
+    assert.equal(left.length, 0,
+      `required objectives still open in the last mission: ${left.map((o) => o.id).join(', ')}`);
+  });
+
+  test('L3 · the place is derived from the story, not hardcoded to m11', () => {
+    // The same mission, the same document, three other pieces of furniture in the same
+    // room. If the place were a guess about Layla's house rather than a reading of the
+    // mission's own beats, one of these would also work.
+    const { game } = reachTheHearth();
+    for (const elsewhere of ['lm-ll-loom', 'lm-ll-table', 'lm-ll-chest']) {
+      assert.equal(game.missions.presentationAt(elsewhere), null,
+        `${elsewhere} offers the reading, so the place is not the hearth the story named`);
+      assert.deepEqual(game.missions.presentAt(elsewhere), [],
+        `presenting at ${elsewhere} completed something`);
+    }
+    assert.equal(game.missions.presentationAt('lm-does-not-exist'), null,
+      'an invented landmark id was accepted');
+    assert.doesNotThrow(() => game.missions.presentAt(null));
+    assert.doesNotThrow(() => game.missions.presentationAt(undefined));
+  });
+
+  test('L4 · the reading follows the conversation, it does not happen during it', () => {
+    // o4 is the hearth dialogue and o5 is the reading at the same hearth. Both are one
+    // interact key on one landmark, so the order has to come from the rules: the beat the
+    // place was derived from must be complete before it can host the next one.
+    const { game, objective } = stageTheHearth({ conversationDone: false });
+    {
+      assert.equal(game.missions.presentationAt(HEARTH), null,
+        'the will can be read aloud before the conversation it follows has happened');
+      assert.deepEqual(game.missions.presentAt(HEARTH), [],
+        'presenting early completed the last objective of the game');
+      assert.notOk(game.missions.state.isObjectiveDone(M11, objective.id));
+
+      // Finish the conversation the way play does, and the same landmark now offers it.
+      game.missions.notify({ kind: EventKind.DIALOGUE, id: 'dt-ll-hearth' });
+      assert.ok(game.missions.state.isObjectiveDone(M11, 'o4'), 'the conversation did not complete');
+      assert.ok(game.missions.presentationAt(HEARTH),
+        'the hearth stopped offering the reading once the conversation was over');
+    }
+  });
+
+  test('L5 · there is nothing to read without the document', () => {
+    const { game, objective } = stageTheHearth({ conversationDone: true });
+    game.missions.state.clues.delete(WILL);
+    assert.notOk(game.missions.state.hasClue(WILL), 'the player still holds the will');
+    assert.equal(game.missions.presentationAt(HEARTH), null,
+      'the hearth offered a reading of a document the player does not have');
+    assert.deepEqual(game.missions.presentAt(HEARTH), []);
+    assert.notOk(game.missions.state.isObjectiveDone(M11, objective.id),
+      'the last objective completed with nothing presented');
+  });
+
+  test('L6 · the prompt says "read aloud", so the player knows to try', () => {
+    // The whole feature is one interact key on a landmark that already had a verb. A
+    // hearth that keeps saying "Talk" after the conversation is over is a hearth nobody
+    // reads at, and the game ends with its last objective quietly incomplete.
+    const { game, bus } = reachTheHearth();
+    // m11 opens on a cinematic, and a cinematic holds the interaction prompt - clear it
+    // the way the player would before asking what the hearth offers.
+    if (game.cinematics?.active) { game.cinematics.skip(); for (let i = 0; i < 20; i++) step(game, 1); }
+    assert.notOk(game.cinematics?.active, 'a cinematic is still holding the prompt');
+
+    game.setRegion('layla-house');
+    const hearth = game.world.region('layla-house').landmarks.find((l) => l.id === HEARTH);
+    assert.ok(hearth, 'the hearth is not in the room it is supposed to be in');
+
+    // Held there rather than placed once: the player slides a little on the first frames
+    // and a prompt test that measured the wrong landmark would still look like a pass.
+    const update = game.squad.update.bind(game.squad);
+    game.squad.update = (dt) => { update(dt); game.player.pos.set(hearth.x, hearth.y, hearth.z); };
+    for (let i = 0; i < 4; i++) step(game, 1);
+
+    const prompt = game.prompt;
+    assert.ok(prompt, 'standing at the hearth published no prompt at all');
+    assert.equal(prompt.id, HEARTH, `the prompt is for ${prompt.id}, not the hearth`);
+    assert.equal(prompt.action, 'اقرأ جهارًا',
+      `the prompt offers "${prompt.action}" where the story wants the will read aloud`);
+
+    // And a verb change at the same landmark has to reach the screen: _publishPrompt()
+    // compared only id and kind, so the new text would have been swallowed.
+    const seen = record(bus, Events.PROMPT);
+    game._publishPrompt({ ...prompt, action: 'حاور' });
+    assert.equal(seen.length, 1,
+      'the prompt did not republish when only its verb changed, so the HUD would keep the old text');
+    // Reading aloud then completes it, through the same key the prompt is offering.
+    assert.equal(game.missions.presentAt(HEARTH).length, 1, 'the offered reading did not complete');
+  });
+
+  test('L7 · the mission manager exposes the reading without a mission running', () => {
+    // A fresh game has no active mission. presentationAt() is called from every landmark
+    // interaction in the game, so it has to be cheap and inert rather than throwing in
+    // the prologue.
+    const { game } = bootGame();
+    assert.deepEqual(game.missions.activeMissions(), [], 'boot started with a mission running');
+    assert.equal(game.missions.presentationAt(HEARTH), null);
+    assert.deepEqual(game.missions.presentAt(HEARTH), []);
+    assert.equal(game.missions.problems.length, 0,
+      'an ordinary interaction with nothing to present was recorded as a problem');
   });
 });
 

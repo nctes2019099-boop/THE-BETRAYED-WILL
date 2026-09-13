@@ -100,6 +100,10 @@ const INTERACT_VERBS = Object.freeze({
   shop: { ar: 'ساوم', en: 'Barter' },
   climb: { ar: 'تسلّق', en: 'Climb' },
   sit: { ar: 'اجلس', en: 'Sit' },
+  // Offered instead of the landmark's own verb when the player is standing at the place
+  // the story sent them to and carrying what they were sent to read. Without it the
+  // hearth keeps saying "Talk" after the conversation has ended.
+  present: { ar: 'اقرأ جهارًا', en: 'Read aloud' },
 });
 
 export class Game {
@@ -1011,7 +1015,10 @@ export class Game {
 
     let next = null;
     if (target) {
-      const verb = INTERACT_VERBS[target.kind] ?? INTERACT_VERBS.examine;
+      const presenting = this.missions.presentationAt(target.id);
+      const verb = presenting
+        ? INTERACT_VERBS.present
+        : (INTERACT_VERBS[target.kind] ?? INTERACT_VERBS.examine);
       next = {
         kind: target.kind, id: target.id,
         label: this.language === 'ar' ? target.ar : target.en,
@@ -1040,8 +1047,16 @@ export class Game {
   }
 
   _publishPrompt(next) {
+    // The verb is part of the identity. Standing at one landmark can offer "Talk" and
+    // then "Read aloud" as the story advances, and comparing only id and kind would keep
+    // the first text on screen forever - the HUD would be telling the player to do
+    // something they have already done, at the exact moment the game wants something
+    // else from them.
     const same = (!next && !this.prompt)
-      || (next && this.prompt && next.id === this.prompt.id && next.kind === this.prompt.kind);
+      || (next && this.prompt
+        && next.id === this.prompt.id
+        && next.kind === this.prompt.kind
+        && next.action === this.prompt.action);
     if (same) return;
     this.prompt = next;
     this.bus.emit(Events.PROMPT, next);
@@ -1084,6 +1099,10 @@ export class Game {
    */
   _notifyLandmark(landmarkId, kind) {
     this.missions.notify({ kind: EventKind.LANDMARK, id: landmarkId });
+    // Presenting what the player carries is checked for every interaction, whatever its
+    // kind: the story decides whether this landmark is the place, and it is the last
+    // objective of the last mission that waits on the answer.
+    this.missions.presentAt(landmarkId);
     switch (kind) {
       case 'examine':
         this.missions.notify({ kind: EventKind.EXAMINE, id: landmarkId });
