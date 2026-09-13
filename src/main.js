@@ -34,7 +34,7 @@
 import * as THREE from '../vendor/three/three.module.js';
 
 import { EventBus, Events } from './core/bus.js';
-import { CAM, MOVE, PERF, STEALTH } from './core/constants.js';
+import { CAM, COMBAT, MOVE, PERF, STEALTH } from './core/constants.js';
 import { RNG, hashString } from './core/rng.js';
 import { Vec3 } from './core/math.js';
 import { InputManager } from './core/input.js';
@@ -51,7 +51,10 @@ import { AISquad, AIState, makeGuard } from './sim/ai.js';
 import { AudioDirector } from './audio/director.js';
 import { createAudioEngine } from './audio/engine.js';
 import { SaveSystem } from './sim/save.js';
-import { SwingPhase, attackProfile } from './sim/combat.js';
+import {
+  SwingPhase, attackProfile, resolveMelee, pickLockTarget, HitOutcome,
+  advanceHitstop, hitstopActive, HITSTOP_TIME_SCALE,
+} from './sim/combat.js';
 
 import { CLUES } from './content/story.js';
 import { detectStorage, gamepadPoller } from './platform/browser.js';
@@ -129,6 +132,17 @@ export class Game {
 
     this.noiseRadius = 0;
     this.noiseAge = Infinity;
+    /**
+     * Impact freeze, in seconds of real time remaining.
+     *
+     * `advanceHitstop` and `hitstopActive` are written against any object with a
+     * `hitstop` field, and the game is the right owner: hitstop scales the simulation
+     * clock, which is the game's clock and not the player's. Putting it on the player
+     * would freeze only the player and leave the guards moving through the impact,
+     * which is the opposite of what the technique is for.
+     */
+    this.hitstop = 0;
+    this._lockSwitchCooldown = 0;
     this.aiming = false;
     this.drawing = false;
     /** The last perception truth handed to the AI. See _fixedUpdate. */
@@ -267,6 +281,13 @@ export class Game {
     // the truth below takes the louder of the two, so a landing rings out over the
     // footsteps and then decays back down to them instead of replacing them.
     this._noiseSub = (p) => {
+      // `local: false` marks a noise that happened somewhere in the world rather than
+      // at the player - a guard being struck ten metres away, an arrow hitting a wall.
+      // Those are sent to the agents by position through squad.notifyAll(), and folding
+      // them into the player's own radius as well would make every agent in the region
+      // hear the same event twice and raise suspicion twice as fast as authored. One
+      // fact, one path.
+      if (p?.local === false) return;
       const r = Number(p?.radius ?? p?.noiseRadius ?? 0);
       if (Number.isFinite(r) && r > this.noiseRadius) this.noiseRadius = r;
       this.noiseAge = 0;
@@ -337,6 +358,16 @@ export class Game {
    * player is in exactly one of them.
    */
   setRegion(id, spawn = null) {
+    // Leaving a region with something still hunting you is what an ESCAPE objective
+    // asks for, and it has to be decided here: _populateAgents() below replaces the
+    // squad, so this is the last frame in which the pursuers are the ones who were
+    // actually chasing. The event carries the region being escaped and `pursued`,
+    // and the matcher requires both, so "cross the tunnel" cannot be completed from
+    // anywhere but the tunnel or without a chase behind you.
+    if (this.regionId && this.regionId !== id && this._inCombat()) {
+      this.missions.notify({ kind: EventKind.ESCAPE, id: this.regionId, pursued: true });
+    }
+
     const space = this.world.region(id);
     if (this.regionMesh) {
       this.scene.remove(this.regionMesh.group);
@@ -348,6 +379,14 @@ export class Game {
     this.regionId = id;
     this.space = space;
     this.regionDef = space.region;
+
+    // Arriving somewhere is the fact a GOTO objective is written against, and three of
+    // them name a region rather than a landmark - m07 "reach the palace exterior",
+    // m11 "go to Layla's house". The matcher accepts a REGION event or a LANDMARK one,
+    // so a region change that notifies nothing leaves those objectives permanently
+    // incomplete no matter where the player walks. notify() also records the visit in
+    // the story state, which is what the save file carries forward.
+    this.missions.notify({ kind: EventKind.REGION, id });
 
     this.lighting.apply(this.regionDef, {
       weather: this.weather,
@@ -361,6 +400,7 @@ export class Game {
     const prevYaw = this.player ? this.player.yaw : 0;
     const prevCamYaw = this.camera ? this.camera.yaw : prevYaw;
     this.player = new PlayerController({
+      id: PLAYER_CHARACTER ?? 'player',
       collision: space.collision,
       bus: this.bus,
       pos: new Vec3(start.x, space.heightAt(start.x, start.z), start.z),
@@ -589,6 +629,17 @@ export class Game {
 
   _fixedUpdate(dt) {
     const intent = this.input.sample(dt);
+    /**
+     * Hitstop scales the world rather than stopping it.
+     *
+     * The timers are advanced on the real dt so a freeze always expires in real time,
+     * while everything simulated runs on the scaled dt. Getting that the other way
+     * round - scaling the timers too - is how an impact freeze becomes permanent: the
+     * clock that would end it is the one being slowed by it.
+     */
+    const frozen = hitstopActive(this);
+    const worldDt = frozen ? dt * HITSTOP_TIME_SCALE : dt;
+    advanceHitstop(this, dt);
     // PlayerController has no bow state to read, so the intent is the authority on
     // whether the player is drawing. Taking it from anywhere else would let the arms
     // and the projectile system disagree about whether a shot was loosed.
@@ -613,8 +664,9 @@ export class Game {
       cinematic: this.cinematics?.active ? this.cinematics.cameraPayload() : null,
     };
 
-    this.player.update(dt, intent, ctx);
-    this.camera.update(dt, this.player, ctx);
+    this._updateLockOn(intent, worldDt);
+    this.player.update(worldDt, intent, ctx);
+    this.camera.update(worldDt, this.player, ctx);
 
     // Noise decays. The value came from the movement system; keeping it forever
     // would mean one footstep alerting every guard in the region permanently.
@@ -630,7 +682,190 @@ export class Game {
     // consumer that has to wrap squad.update to observe it loses the wrapper the
     // moment a region change replaces the squad.
     this.lastTruth = this._buildTruth();
-    this.squad.update(dt, this.lastTruth);
+    this.squad.update(worldDt, this.lastTruth);
+
+    // Last, and after both sides have moved. Resolving before the squad updates would
+    // test this frame's swings against last frame's positions, so a blow the player
+    // visibly landed would miss and a blow they visibly dodged would connect.
+    this._resolveCombat();
+  }
+
+  /* ------------------------------------------------------------------ combat */
+
+  /**
+   * Make the blows that were authored actually land.
+   *
+   * The whole of melee resolution existed and was unit-tested: resolveMelee() gates
+   * reach, arc, i-frames, block, parry, stagger, guard break, damage and death, and
+   * AISquad.resolveAttacks() collects a frame's agent swings in one deterministic
+   * order. ai-test called resolveAttacks() directly and passed. Nothing in the runtime
+   * ever called it, and nothing resolved the player's swings at all, so in the shipped
+   * game guards swung and dealt no damage, the player swung and dealt no damage, the
+   * only way to lose health was to fall, and the only way to kill a guard was not to
+   * exist. Three missions carry a non-optional COMBAT objective, so the story could
+   * not be finished.
+   *
+   * Both directions go through the same resolveMelee(), which is the point: one
+   * implementation of a hit, so the player and the guards cannot end up with different
+   * rules.
+   */
+  _resolveCombat() {
+    const player = this.player;
+    if (!player || player.isDead || !this.squad) return;
+
+    // --- the player's swing, against the agent it is most likely aimed at ----
+    const swing = player.swing;
+    if (swing && swing.phase === SwingPhase.ACTIVE && !swing.hitConsumed) {
+      const target = this._pickStrikeTarget();
+      if (target) {
+        const result = resolveMelee(player, target.body, swing, {
+          bus: this.bus, source: player.id,
+        });
+        if (result.outcome !== HitOutcome.MISS) {
+          this._afterBlow(result, target, false);
+        }
+      }
+    }
+
+    // --- every agent's live swing, against the player ------------------------
+    for (const hit of this.squad.resolveAttacks(player, { bus: this.bus })) {
+      if (hit.result.outcome === HitOutcome.MISS) continue;
+      const agent = this.squad.agents.find((a) => a.id === hit.id) ?? null;
+      if (agent) this._afterBlow(hit.result, agent, true);
+    }
+  }
+
+  /**
+   * Which agent the player's swing is aimed at.
+   *
+   * A selection, not a second reach test: resolveMelee() does the geometry itself and
+   * refuses what it should. Picking first is what stops a swing from spending itself on
+   * the wrong body - resolveMelee() marks a swing consumed on the first defender it
+   * touches, so iterating the crowd in array order would hit whoever happened to be
+   * first rather than whoever the player faced.
+   *
+   * Any living agent is a legal target, hostile or not. A neutral servant who cannot be
+   * struck is an invisible immunity, and m04 asks the player to silence a watching
+   * servant.
+   */
+  _pickStrikeTarget() {
+    const swing = this.player.swing;
+    const profile = swing?.profile ?? attackProfile(swing?.kind ?? 'light') ?? attackProfile('light');
+    const bodies = [];
+    for (const a of this.squad.agents) {
+      if (!a.body || a.body.isDead) continue;
+      bodies.push(a.body);
+    }
+    if (bodies.length === 0) return null;
+    const best = pickLockTarget(bodies, this.player.pos, this.player.yaw, {
+      range: profile.reachMax ?? COMBAT.MELEE_REACH_MAX,
+      angleDeg: COMBAT.MELEE_ARC_DEG * 0.5,
+      current: this.player.lockTarget?.body ?? null,
+    });
+    if (!best) return null;
+    return this.squad.agents.find((a) => a.body === best) ?? null;
+  }
+
+  /**
+   * What a connected blow does to the world beyond the two bodies in it.
+   *
+   * @param {object} result        resolveMelee()'s return
+   * @param {object} agent         the agent involved, whichever side it was on
+   * @param {boolean} onPlayer     true when the player was the defender
+   */
+  _afterBlow(result, agent, onPlayer) {
+    if (result.hitstop > 0) this.hitstop = Math.max(this.hitstop, result.hitstop);
+
+    const pos = onPlayer ? this.player.pos : (agent?.body?.pos ?? this.player.pos);
+    if (result.applied <= 0 && !result.killed && !result.parried) return;
+
+    // A sword connecting with a person is loud, and the guards' own hearing model says
+    // how loud: NOISE_COMBAT_HIT is authored at 22m, further than a sprint. Sent by
+    // position rather than through the player's own noise latch, so agents near the blow
+    // hear it once and only once.
+    if (result.applied > 0 || result.killed) {
+      this._worldNoise(STEALTH.NOISE_COMBAT_HIT, pos, 'combat-hit');
+    }
+    if (result.parried) {
+      // A parry is steel on steel and carries further than flesh, but it is the sound
+      // of a fight that has not landed yet.
+      this._worldNoise(STEALTH.NOISE_COMBAT_HIT * 0.7, pos, 'parry');
+    }
+
+    if (!result.killed) return;
+
+    // A body falling is a second, lower sound, and then an alarm: nobody within earshot
+    // of a killing keeps patrolling.
+    this._worldNoise(STEALTH.NOISE_BODY_FALL, pos, 'body-fall');
+    this.squad.notifyAll('alarm', { pos, radius: STEALTH.NOISE_COMBAT_HIT });
+
+    if (!onPlayer) {
+      // The objective is completed by an event, not by a variable being set somewhere.
+      // Without this notification a guard dies, the counter does not move, and m06,
+      // m10 and m11 can never be finished.
+      this.missions.notify({ kind: EventKind.KILL, id: agent?.id ?? null });
+    }
+  }
+
+  /**
+   * A noise that happened at a place, not at the player.
+   *
+   * `local: false` is what keeps it out of the player's own loudness latch; see
+   * _noiseSub. Agents receive it by position with a distance cutoff, which is the same
+   * model the hearing system already uses for the player's footsteps.
+   */
+  _worldNoise(radius, pos, source) {
+    this.bus.emit(Events.NOISE_EMITTED, {
+      radius, source, local: false,
+      pos: { x: pos.x, y: pos.y, z: pos.z },
+    });
+    this.squad.notifyAll('alarm', { pos, radius });
+  }
+
+  /**
+   * Lock-on: pick, cycle, and let go.
+   *
+   * player.lockTarget was read by the camera (CameraMode.LOCKED) and by the movement
+   * system (MOVE.TURN_RATE_LOCKED) and written by nothing, so the authored lock-on
+   * behaviour - a framed target and a faster turn - was unreachable. The switch
+   * cooldown is honoured through pickLockTarget's own stickiness rather than
+   * reimplemented here.
+   */
+  _updateLockOn(intent, dt) {
+    this._lockSwitchCooldown = Math.max(0, this._lockSwitchCooldown - dt);
+    const player = this.player;
+    if (!player || player.isDead) { if (player) player.lockTarget = null; return; }
+
+    if (intent.lockOn) {
+      const current = player.lockTarget?.body ?? null;
+      const next = pickLockTarget(this._lockCandidates(), player.pos, player.yaw, {
+        current,
+        canSwitch: this._lockSwitchCooldown <= 0,
+        range: COMBAT.LOCK_ON_RANGE,
+        angleDeg: COMBAT.LOCK_ON_ANGLE_DEG,
+      });
+      if (next && next !== current) this._lockSwitchCooldown = COMBAT.LOCK_ON_SWITCH_COOLDOWN;
+      player.lockTarget = next ? this.squad.agents.find((a) => a.body === next) ?? null : null;
+      return;
+    }
+    // Released, or the target died or walked out of range: let go. pickLockTarget breaks
+    // the lock past LOCK_ON_BREAK_RANGE, so a chase does not stay locked to a guard the
+    // player has run past.
+    if (!player.lockTarget) return;
+    const still = pickLockTarget([player.lockTarget.body], player.pos, player.yaw, {
+      current: player.lockTarget.body, canSwitch: false,
+      range: COMBAT.LOCK_ON_BREAK_RANGE, angleDeg: 180,
+    });
+    if (!still || player.lockTarget.body.isDead) player.lockTarget = null;
+  }
+
+  /** Living agents, as the bodies pickLockTarget wants. */
+  _lockCandidates() {
+    const out = [];
+    for (const a of this.squad?.agents ?? []) {
+      if (a.body && !a.body.isDead) out.push(a.body);
+    }
+    return out;
   }
 
   /**

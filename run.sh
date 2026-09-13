@@ -29,7 +29,14 @@ REQUIRED_SUITES=(
   reach-test.mjs
   runtime-test.mjs
   playthrough.mjs
+  battle-test.mjs
 )
+# battle-test.mjs is appended rather than inserted: the mandated suites keep their
+# mandated relative order and nothing is displaced. It is required rather than merely
+# additional because it is the only gate that drives combat through the real frame
+# loop. combat-test.mjs and ai-test.mjs both call the resolvers directly, which is how
+# a game in which nothing resolved a single blow - guards dealing no damage, the player
+# dealing none, three required objectives unreachable - passed every suite it had.
 # ai-test.mjs and input-test.mjs are additions beyond the seven §22 names, not
 # substitutions: the mandated suites keep their mandated relative order, and both
 # additions sit between them rather than displacing any.

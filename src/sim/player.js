@@ -67,6 +67,15 @@ export class PlayerController {
   constructor(opts = {}) {
     this.collision = opts.collision ?? null;
     this.bus = opts.bus ?? null;
+    /**
+     * Who this is, for bus payloads.
+     *
+     * resolveMelee() puts `attacker.id` into COMBAT_HIT, COMBAT_PARRIED and
+     * COMBAT_KILL, and without an id those events carry `undefined` - which the HUD
+     * tolerates and a save file does not. The runtime passes the canonical player
+     * character so a combat log names the same person the story does.
+     */
+    this.id = opts.id ?? 'player';
     this.pos = opts.pos ? opts.pos.clone() : new Vec3(0, 0, 0);
     /** Body facing (yaw). Camera yaw is separate — the body follows movement. */
     this.yaw = opts.yaw ?? 0;
