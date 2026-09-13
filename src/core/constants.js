@@ -23,6 +23,11 @@ export const MOVE = Object.freeze({
   INJURED_WALK_SPEED: 1.55,
   INJURED_CROUCH_SPEED: 0.95,
   LEDGE_SHIMMY_SPEED: 1.1,
+  // Below this planar speed the character is standing, not locomoting, and makes no
+  // footfall noise at all. Without a floor, the residual velocity of a stopping
+  // character keeps a noise radius alive for several frames after the player lets go
+  // of the key, and a guard hears a footstep nobody took.
+  NOISE_IDLE_SPEED: 0.2,
 
   // Stick deflection at which the walk band hands over to the run band.
   // Below it the player walks (stealth pacing, precise positioning); above it

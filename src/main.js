@@ -24,10 +24,11 @@
  * perception system so that what the player sees is what the AI is allowed to see.
  *
  * ── Noise is the simulation's number, not a guess ────────────────────────────
- * The perception truth carries `noiseRadius`. It is taken from the NOISE_EMITTED
- * events the movement system already produces and allowed to decay, rather than
- * derived here from speed. Two sources for one fact is how an AI ends up hearing
- * footsteps the player never made.
+ * The perception truth carries `noiseRadius`, and it comes in two kinds. Locomotion
+ * is a LEVEL owned by the movement system and read straight off the controller each
+ * step. Transients - a landing - arrive as NOISE_EMITTED events, are latched at their
+ * peak and allowed to decay. Nothing here derives loudness from speed: two sources
+ * for one fact is how an AI ends up hearing footsteps the player never made.
  */
 
 import * as THREE from '../vendor/three/three.module.js';
@@ -131,6 +132,9 @@ export class Game {
     this.lastTruth = null;
     this.prompt = null;
     this.paused = false;
+    /** Last published detection level and suspicion bucket. See _publishDetection. */
+    this._detectionLevel = null;
+    this._detectionBucket = -1;
 
     this.telemetry = {
       bootMs: 0, fps: 0, frameMs: 0, steps: 0, drawCalls: 0,
@@ -246,8 +250,9 @@ export class Game {
     this.scene.add(this.playerRig.root);
     this.npcRigs = new Map();
 
-    // The movement system already reports how loud it is; the perception system is
-    // given that number rather than a second opinion computed here.
+    // Transients only. The movement system reports its own continuous loudness and
+    // the truth below takes the louder of the two, so a landing rings out over the
+    // footsteps and then decays back down to them instead of replacing them.
     this._noiseSub = (p) => {
       const r = Number(p?.radius ?? p?.noiseRadius ?? 0);
       if (Number.isFinite(r) && r > this.noiseRadius) this.noiseRadius = r;
@@ -565,6 +570,8 @@ export class Game {
     this.noiseAge += dt;
     if (this.noiseAge > NOISE_DECAY_S) { this.noiseRadius = 0; this.noiseAge = Infinity; }
 
+    this._publishDetection();
+
     this.missions.update(dt * 1000);   // MissionManager works in milliseconds
 
     // Recorded on the game, not only passed down. It is the value that decides
@@ -594,7 +601,10 @@ export class Game {
       inShadow: this._inHidingSpot(),
       weather: this.weather,
       isNight: this.lighting.isNight,
-      noiseRadius: this.noiseRadius,
+      // The louder of the latched transient and the live locomotion level. Reading
+      // only the latch is what left the AI deaf: nothing emitted the event, so the
+      // truth carried 0 forever and no guard ever heard a sprint six metres away.
+      noiseRadius: Math.max(this.noiseRadius, this.player.noiseRadius ?? 0),
     };
   }
 
@@ -604,6 +614,45 @@ export class Game {
       if (Math.hypot(h.x - p.x, h.z - p.z) < 1.1) return true;
     }
     return false;
+  }
+
+  /**
+   * Tell the HUD how close to being caught the player is.
+   *
+   * The page has always listened for DETECTION and drawn a meter from it. Nothing
+   * emitted DETECTION: the AI publishes SUSPICION_CHANGED, and only when a threshold
+   * is crossed, which is the right granularity for an AI and the wrong one for a
+   * meter - a bar that jumps from empty to "alerted" in one step tells the player
+   * nothing about how much of a mistake they just made. So the runtime derives a
+   * continuous level from the squad each step and publishes it on change.
+   *
+   * Aggregation lives here rather than in ai.js because it is a question about the
+   * squad as a whole, and the squad is the runtime's.
+   */
+  _publishDetection() {
+    let worst = 0;
+    let hostile = false;
+    for (const a of this.squad?.agents ?? []) {
+      if (a.state === AIState.DEAD) continue;
+      const s = Number.isFinite(a.suspicion) ? a.suspicion : 0;
+      if (s > worst) worst = s;
+      if (a.state === AIState.CHASE || a.state === AIState.ATTACK || a.state === AIState.CIRCLE) hostile = true;
+    }
+    // Four levels, because that is what the meter can draw: calm, suspicious,
+    // alerted, combat. SUSPICION_SEARCH_THRESHOLD (68) sits between alerted and
+    // combat and the HUD has no fourth colour or string for it, so it is not a
+    // separate level here - inventing one would render as a raw key on screen.
+    const level = hostile || worst >= STEALTH.SUSPICION_COMBAT_THRESHOLD ? 'combat'
+      : worst >= STEALTH.SUSPICION_ALERT_THRESHOLD ? 'alerted'
+        : worst > 0.5 ? 'suspicious' : 'calm';
+
+    // Only on a change worth drawing. A meter emits at most a handful of times per
+    // encounter instead of sixty times a second for nothing.
+    const bucket = Math.round(worst);
+    if (level === this._detectionLevel && bucket === this._detectionBucket) return;
+    this._detectionLevel = level;
+    this._detectionBucket = bucket;
+    this.bus.emit(Events.DETECTION, { level, suspicion: worst, hostile, bucket });
   }
 
   _inCombat() {

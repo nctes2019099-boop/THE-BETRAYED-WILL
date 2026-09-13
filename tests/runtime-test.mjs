@@ -35,13 +35,16 @@ import { StoryState } from '../src/sim/story-state.js';
 import { CLUE_MAP } from '../src/content/story.js';
 
 const CLUE = Object.keys(CLUE_MAP)[0];
-import { AIState, effectiveDetectRange, exposureFor, perceptionProbe } from '../src/sim/ai.js';
+import { AIState, effectiveDetectRange, exposureFor, perceptionProbe, noiseAudibility } from '../src/sim/ai.js';
 import { REGIONS, REGION_MAP } from '../src/content/world-data.js';
 import { MemoryStorage } from '../src/sim/save.js';
 import { Conversation, TREE_BY_LANDMARK, muteEvents } from '../src/sim/conversation.js';
 import { DialogueWalker } from '../src/sim/dialogue.js';
 import { DIALOGUE_TREES, Flags } from '../src/content/dialogue.js';
 import { CLUES, MISSIONS } from '../src/content/story.js';
+
+/** The four detection levels index.html has a localized string and a colour for. */
+const STRINGS_LEVELS = ['calm', 'suspicious', 'alerted', 'combat'];
 import { LANDMARKS } from '../src/content/world-data.js';
 import * as THREE from '../vendor/three/three.module.js';
 
@@ -1383,6 +1386,206 @@ describe('runtime — the page/runtime contract', () => {
     assert.gt(imports.length, 0, 'the page must import the runtime');
     const missing = imports.filter((spec) => !existsSync(new URL(spec, PAGE_URL)));
     assert.deepEqual(missing, [], `imports that resolve to nothing: ${missing.join(', ')}`);
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * IX — noise and detection reach the runtime.
+ *
+ * A stealth game has exactly one unforgivable failure in each direction: a guard who
+ * sees the player in visible shadow, and a guard who cannot hear the player
+ * sprinting six metres behind him. Group III covers the first. This covers the
+ * second, and it was broken the whole time.
+ *
+ * ai.js has a complete hearing model - noiseAudibility() with an authored falloff
+ * exponent, weather masking, suspicion gain, last-known-position memory - and the
+ * perception truth it was handed carried noiseRadius 0 on every frame of every
+ * playthrough. The runtime waited for a NOISE_EMITTED event to tell it the level;
+ * nothing in the repository emitted one; player.js did not contain the word "noise".
+ * Measured: walking 3.97 m and sprinting 6.02 m both reported 0.00 against authored
+ * radii of 5.2 and 17.5, and three guards accumulated exactly zero suspicion.
+ *
+ * Separately, index.html has always listened for DETECTION to draw the detection
+ * meter. Nothing emitted DETECTION either: the AI publishes SUSPICION_CHANGED, and
+ * only on a threshold crossing, so the meter never moved at all.
+ * ---------------------------------------------------------------------- */
+
+/** Pin an agent at a distance from the player, holding it there across steps. */
+function placeAgentAt(game, agent, metres) {
+  const p = game.player.pos;
+  agent.body.pos.set(p.x + metres, p.y, p.z);
+}
+
+describe('runtime — noise and detection', () => {
+  test('IX1 · each gait reports the radius the constants author for it', () => {
+    // The number the AI hears and the number the level design wrote down must be the
+    // same number. A gait that reports anything else silently retunes the whole
+    // stealth layer, and nothing about it looks like a bug from inside the game.
+    const gaits = [
+      ['crouch', 'KeyC', null, STEALTH.NOISE_CROUCH_WALK],
+      ['walk', null, null, STEALTH.NOISE_RUN],     // an unmodified key is a run
+      ['sprint', null, 'ShiftLeft', STEALTH.NOISE_SPRINT],
+    ];
+    for (const [name, crouchKey, sprintKey, expected] of gaits) {
+      const { game } = bootGame();
+      if (crouchKey) { game.input.handleEvent('keydown', { code: crouchKey }); step(game, 4); }
+      if (sprintKey) game.input.handleEvent('keydown', { code: sprintKey });
+      game.input.handleEvent('keydown', { code: 'KeyD' });
+      let peak = 0;
+      for (let i = 0; i < 40; i++) { step(game, 1); peak = Math.max(peak, game.lastTruth.noiseRadius); }
+      assert.close(peak, expected, 0.05, `${name} reported ${peak.toFixed(2)}m, authored ${expected}m`);
+      game.input.handleEvent('keyup', { code: 'KeyD' });
+    }
+  });
+
+  test('IX2 · standing still is silent, and stays silent', () => {
+    const { game } = bootGame();
+    game.input.handleEvent('keydown', { code: 'KeyD' });
+    step(game, 30);
+    assert.gt(game.lastTruth.noiseRadius, 1, 'moving is loud');
+    game.input.handleEvent('keyup', { code: 'KeyD' });
+    step(game, 30);
+    assert.equal(game.lastTruth.noiseRadius, 0,
+      'and letting go of the key must stop the noise - a residual radius is a footstep nobody took');
+  });
+
+  test('IX3 · crouching is quieter than walking, which is the whole point of crouching', () => {
+    const { game } = bootGame();
+    game.input.handleEvent('keydown', { code: 'KeyC' });
+    step(game, 4);
+    game.input.handleEvent('keydown', { code: 'KeyD' });
+    let crouchPeak = 0;
+    for (let i = 0; i < 40; i++) { step(game, 1); crouchPeak = Math.max(crouchPeak, game.lastTruth.noiseRadius); }
+    // crouch is a toggle, not a hold: releasing the key leaves the character on the
+    // ground and the comparison would measure crouching against crouching.
+    game.input.handleEvent('keydown', { code: 'KeyC' });
+    game.input.handleEvent('keyup', { code: 'KeyC' });
+    step(game, 20);
+    assert.equal(game.player.stance, 'stand', 'the character must be standing again');
+    let standPeak = 0;
+    for (let i = 0; i < 40; i++) { step(game, 1); standPeak = Math.max(standPeak, game.lastTruth.noiseRadius); }
+    assert.lt(crouchPeak, standPeak,
+      `crouch ${crouchPeak.toFixed(2)}m must be quieter than standing ${standPeak.toFixed(2)}m`);
+  });
+
+  test('IX4 · a landing is an authored transient, split at the height that starts to hurt', () => {
+    const { game, bus } = bootGame();
+    const noises = [];
+    bus.on(Events.NOISE_EMITTED, (p) => noises.push(p));
+    // Drop the player from above the height at which falling costs health.
+    const p = game.player.pos;
+    game.player.setPosition(p.x, p.y + MOVE.FALL_DAMAGE_SAFE_HEIGHT + 4, p.z);
+    game.player.grounded = false;
+    game.player.verticalVelocity = 0;
+    for (let i = 0; i < 240 && noises.length === 0; i++) step(game, 1);
+    assert.gt(noises.length, 0, 'a heavy drop must be heard');
+    const heavy = noises[noises.length - 1];
+    assert.equal(heavy.radius, STEALTH.NOISE_LAND_HEAVY,
+      `a drop that costs health must report ${STEALTH.NOISE_LAND_HEAVY}m, reported ${heavy.radius}m`);
+    assert.ok(heavy.source && heavy.source.startsWith('land'), 'and say what made it');
+  });
+
+  test('IX5 · the truth carries the louder of the transient and the footsteps', () => {
+    // A landing rings out over the walk and then decays back down to it. Taking only
+    // the latch would leave a footstep audible for 0.6s after the player stopped;
+    // taking only the level would drop the landing entirely.
+    const { game } = bootGame();
+    game.noiseRadius = 20;      // a latched transient
+    game.noiseAge = 0;
+    game.player.noiseRadius = 5.2;
+    const truth = game._buildTruth();
+    assert.equal(truth.noiseRadius, 20, 'the louder of the two wins');
+    game.noiseRadius = 2;
+    const softer = game._buildTruth();
+    assert.equal(softer.noiseRadius, 5.2, 'and the footsteps still carry when the transient is quieter');
+  });
+
+  test('IX6 · a guard hears the player sprinting past him', () => {
+    // The end-to-end claim, and the one that was false before this fix. hearings is
+    // incremented only by the hearing branch of the AI, so it cannot be confounded by
+    // the agent also happening to see the player.
+    const { game } = bootGame();
+    const agent = game.squad.agents[0];
+    assert.ok(agent, 'the region must have a guard');
+    const before = agent.telemetry.hearings;
+    game.input.handleEvent('keydown', { code: 'ShiftLeft' });
+    game.input.handleEvent('keydown', { code: 'KeyD' });
+    for (let i = 0; i < 30; i++) { placeAgentAt(game, agent, 6); step(game, 1); }
+    assert.gt(agent.telemetry.hearings, before,
+      'a sprint 6m from a guard must be audible - the authored sprint radius is 17.5m');
+    assert.gt(agent.suspicion, 0, 'and it must raise his suspicion');
+  });
+
+  test('IX7 · the same guard does not hear the player crouch-walking past him', () => {
+    // The other half of the design: at 4m a sprint is heard and a crouch-walk is not,
+    // because 2.4m < 4m < 17.5m. If both were silent the stealth layer would be
+    // decoration; if both were heard, crouching would be pointless.
+    const { game } = bootGame();
+    const agent = game.squad.agents[0];
+    const before = agent.telemetry.hearings;
+    game.input.handleEvent('keydown', { code: 'KeyC' });
+    step(game, 4);
+    game.input.handleEvent('keydown', { code: 'KeyD' });
+    for (let i = 0; i < 30; i++) { placeAgentAt(game, agent, 4); step(game, 1); }
+    assert.equal(agent.telemetry.hearings, before,
+      `crouch-walking 4m away must be silent (radius ${STEALTH.NOISE_CROUCH_WALK}m)`);
+  });
+
+  test('IX8 · rain masks footsteps, because the constants say it does', () => {
+    // AMBIENT_MASK_RAIN is authored at 0.72 and documented in the constants as a real
+    // stealth tool. A masking factor nothing applies is a number in a file.
+    const clear = noiseAudibility(STEALTH.NOISE_WALK, 4, 'clear');
+    const rain = noiseAudibility(STEALTH.NOISE_WALK, 4, 'rain');
+    const storm = noiseAudibility(STEALTH.NOISE_WALK, 4, 'storm');
+    assert.gt(clear, 0, 'audible in the clear at 4m of a 5.2m radius');
+    assert.lt(rain, clear, 'rain must reduce it');
+    assert.lt(storm, rain, 'and a storm more');
+  });
+
+  test('IX9 · the detection meter is published with a level the page can draw', () => {
+    const { game, bus } = bootGame();
+    const seen = [];
+    bus.on(Events.DETECTION, (p) => seen.push(p));
+    step(game, 6);
+    assert.gt(seen.length, 0, 'the page has always listened for this and nothing ever sent it');
+    assert.equal(seen[0].level, 'calm', 'an empty courtyard is calm');
+    // Escalate through the authored thresholds.
+    const agent = game.squad.agents[0];
+    const levels = [];
+    for (const s of [10, STEALTH.SUSPICION_ALERT_THRESHOLD + 1, STEALTH.SUSPICION_COMBAT_THRESHOLD + 1]) {
+      agent.suspicion = s;
+      step(game, 2);
+      levels.push(seen[seen.length - 1].level);
+    }
+    assert.deepEqual(levels, ['suspicious', 'alerted', 'combat'],
+      `the meter must escalate through every level the HUD has a colour for, got ${levels.join(' → ')}`);
+    for (const l of levels.concat('calm')) {
+      assert.ok(STRINGS_LEVELS.includes(l), `the page cannot localize the level "${l}"`);
+    }
+  });
+
+  test('IX10 · the detection meter is not published sixty times a second', () => {
+    // A meter emits when it changes. Publishing every frame would put an event on the
+    // bus 60 times a second for a value that moves a handful of times per encounter.
+    const { game, bus } = bootGame();
+    let count = 0;
+    bus.on(Events.DETECTION, () => { count++; });
+    step(game, 120);
+    assert.lt(count, 12, `2 seconds of a calm courtyard produced ${count} detection events`);
+    assert.gt(count, 0, 'but the first state must be published');
+  });
+
+  test('IX11 · a hostile guard reads as combat regardless of the suspicion number', () => {
+    const { game, bus } = bootGame();
+    const seen = [];
+    bus.on(Events.DETECTION, (p) => seen.push(p));
+    const agent = game.squad.agents[0];
+    agent.state = AIState.CHASE;
+    agent.suspicion = 0;
+    step(game, 4);
+    assert.equal(seen[seen.length - 1].level, 'combat',
+      'a guard already swinging is combat even if his suspicion meter was reset');
+    assert.equal(seen[seen.length - 1].hostile, true);
   });
 });
 

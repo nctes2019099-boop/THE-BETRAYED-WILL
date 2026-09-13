@@ -6,7 +6,7 @@
 // acceleration, clean stopping, reliable transitions. Every one of those is a
 // named, asserted property in the test suite — not an aspiration.
 
-import { Vec3, clamp, lerp, wrapAngle, smoothstep, moveTowardsAngle } from '../core/math.js';
+import { Vec3, clamp, lerp, remap, wrapAngle, smoothstep, moveTowardsAngle } from '../core/math.js';
 import { MOVE, COMBAT, CAM, STEALTH } from '../core/constants.js';
 import { Events } from '../core/bus.js';
 import { computeFallDamage, probeLedge, mantlePosition, ledgeGrabIsAllowed, hangUpdate } from './traversal.js';
@@ -81,6 +81,11 @@ export class PlayerController {
 
     this.state = PlayerState.IDLE;
     this.stance = Stance.STAND;
+    /**
+     * How loud the locomotion is right now, in metres - the unit the AI's hearing
+     * model and the STEALTH noise constants both speak in.
+     */
+    this.noiseRadius = 0;
     this.crouchBlend = 0;       // 0 standing, 1 crouched — drives capsule height
     this.speedPlanar = 0;
 
@@ -344,6 +349,7 @@ export class PlayerController {
     }
     this.telemetry.distance += this.pos.distanceXZ(before.pos);
     if (this.speedPlanar > this.telemetry.topSpeed) this.telemetry.topSpeed = this.speedPlanar;
+    this.noiseRadius = this._computeLocomotionNoise();
     return {
       state: this.state,
       pos: this.pos.clone(),
@@ -353,7 +359,49 @@ export class PlayerController {
       stance: this.stance,
       health: this.health,
       stamina: this.stamina,
+      noiseRadius: this.noiseRadius,
     };
+  }
+
+  /**
+   * How loud the movement itself is, in metres.
+   *
+   * This belongs here and nowhere else. The runtime used to wait for a NOISE_EMITTED
+   * event to tell it the level, and nothing ever emitted one, so the perception truth
+   * carried noiseRadius 0 for the entire game: measured, a player walking 3.97 m and
+   * a player sprinting 6.02 m both reported 0.00 against authored radii of 5.2 and
+   * 17.5. ai.js has a complete hearing model - falloff exponent, weather masking,
+   * suspicion gain, last-known-position memory - and it was being told, correctly and
+   * every frame, that the player made no sound. Crouch-walking, sprinting past a
+   * guard, and rain masking footsteps were all authored, all tested, and none of them
+   * reachable. One fact, one owner.
+   *
+   * Locomotion is a LEVEL, read straight off the controller. Transients - a landing -
+   * are EVENTS, emitted as NOISE_EMITTED and left to decay in the runtime. Folding
+   * the level into the event latch would keep a footstep audible for 0.6 s after the
+   * player stopped walking.
+   *
+   * The curve interpolates between the authored radii rather than stepping between
+   * them, so accelerating out of a walk does not jump the audible radius from 5.2 m to
+   * 11.5 m in one frame. `remap` clamps, so a dodge at 9.4 m/s saturates at the
+   * sprint radius instead of extrapolating past it.
+   */
+  _computeLocomotionNoise() {
+    const speed = this.speedPlanar;
+    if (!this.grounded || !Number.isFinite(speed) || speed < MOVE.NOISE_IDLE_SPEED) {
+      return STEALTH.NOISE_SILENT;
+    }
+    if (this.stance === Stance.CROUCH) {
+      const crouchSpeed = this.injured ? MOVE.INJURED_CROUCH_SPEED : MOVE.CROUCH_SPEED;
+      return STEALTH.NOISE_CROUCH_WALK * clamp(speed / Math.max(0.1, crouchSpeed), 0, 1);
+    }
+    if (speed <= MOVE.WALK_SPEED) {
+      return remap(speed, MOVE.NOISE_IDLE_SPEED, MOVE.WALK_SPEED, STEALTH.NOISE_SILENT, STEALTH.NOISE_WALK);
+    }
+    if (speed <= MOVE.RUN_SPEED) {
+      return remap(speed, MOVE.WALK_SPEED, MOVE.RUN_SPEED, STEALTH.NOISE_WALK, STEALTH.NOISE_RUN);
+    }
+    return remap(speed, MOVE.RUN_SPEED, MOVE.SPRINT_SPEED, STEALTH.NOISE_RUN, STEALTH.NOISE_SPRINT);
   }
 
   /* --------------------------------------------------------------- timers */
@@ -1020,6 +1068,17 @@ export class PlayerController {
       mitigated: result.mitigated,
     });
 
+    // A landing is a transient, so it is an event and the runtime lets it decay. The
+    // light/heavy split uses the height at which falling starts to cost health: a drop
+    // that hurts you is a drop a guard hears across the courtyard, and both numbers
+    // are already authored rather than chosen here.
+    this._emit('NOISE_EMITTED', {
+      radius: dropHeight >= MOVE.FALL_DAMAGE_SAFE_HEIGHT
+        ? STEALTH.NOISE_LAND_HEAVY : STEALTH.NOISE_LAND_LIGHT,
+      pos: { x: this.pos.x, y: this.pos.y, z: this.pos.z },
+      source: dropHeight >= MOVE.FALL_DAMAGE_SAFE_HEIGHT ? 'land-heavy' : 'land-light',
+    });
+
     if (result.damage > 0) {
       this.telemetry.fallDamageEvents++;
       this.lastFallDamage = { height: dropHeight, ...result };
@@ -1180,6 +1239,7 @@ const EVENT_ALIAS = {
   PLAYER_LEDGE_GRAB: Events.PLAYER_LEDGE_GRAB,
   PLAYER_LEDGE_RELEASE: Events.PLAYER_LEDGE_RELEASE,
   PLAYER_ENTERED_REGION: Events.PLAYER_ENTERED_REGION,
+  NOISE_EMITTED: Events.NOISE_EMITTED,
   'player:state': 'player:state',
 };
 function resolveEventName(name) { return EVENT_ALIAS[name] ?? name; }
