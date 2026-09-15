@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>THE BETRAYED WILL — الوصية المخذولة</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400&family=Cairo:wght@400;600;700&family=Cinzel:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <canvas id="game" tabindex="0"></canvas>
+  <button id="lang-btn" type="button" title="Language">EN</button>
+
+  <div id="boot">
+    <img class="crest" src="assets/art/crest.png" alt="crest" />
+    <h1 class="logo">THE BETRAYED WILL</h1>
+    <p class="sub">إيقاظ عشرة آلاف وكيل لبناء العالم، القصة، التضاريس، الكاميرا، الصوت، والطبقات.</p>
+    <div id="boot-bar-wrap"><div id="boot-bar"></div></div>
+    <div id="boot-pct">0%</div>
+    <div id="boot-log"></div>
+    <button class="btn" id="skip-boot" type="button">تخطي البناء / Skip</button>
+  </div>
+
+  <div id="title-screen" class="hidden">
+    <img class="crest" src="assets/art/crest.png" alt="crest" />
+    <h1 class="logo">THE BETRAYED WILL</h1>
+    <p class="sub">الوصية المخذولة — مُلكٌ كُتب ثم شُطب. عُد إلى فارِث واستعد الجملة الناقصة.</p>
+    <div class="row">
+      <button class="btn" id="btn-play" type="button">ابدأ / Play</button>
+      <button class="btn" id="btn-studio" type="button">مجلس العشرة آلاف / Studio</button>
+    </div>
+  </div>
+
+  <div id="hud" class="hidden">
+    <div id="place-name"></div>
+    <div id="frags">0 / 4</div>
+    <div id="hover-name" class="hidden"></div>
+    <div id="prompt" class="hidden"></div>
+    <div id="help">
+      WASD / الأسهم حركة · E تفاعل · M خريطة · Tab الوكلاء · Q لغة · Esc
+    </div>
+  </div>
+
+  <div id="dialogue" class="hidden">
+    <div id="portrait"></div>
+    <div>
+      <div id="speaker"></div>
+      <div id="line"></div>
+      <div id="choices"></div>
+    </div>
+  </div>
+
+  <div id="combat" class="hidden">
+    <div id="combat-hp"></div>
+    <div id="combat-track"><div id="combat-window"></div></div>
+    <div class="combat-hint">E في الوميض — اضرب الختم</div>
+  </div>
+
+  <div id="map-overlay" class="hidden">
+    <h2>الخريطة</h2>
+    <canvas id="map-inner"></canvas>
+    <p class="sub">M للإغلاق</p>
+  </div>
+
+  <div id="ending" class="hidden">
+    <h2 id="end-title"></h2>
+    <p id="end-body" class="sub"></p>
+    <button class="btn" id="btn-again" type="button">مسار آخر / Another path</button>
+  </div>
+
+  <div id="studio" class="hidden">
+    <aside id="studio-side">
+      <h1 class="logo" style="font-size:1.2rem">10,000 AGENTS</h1>
+      <div id="studio-meta"></div>
+      <div id="studio-depts"></div>
+      <div id="qa-box"></div>
+      <div id="studio-log"></div>
+      <button class="btn" id="studio-close" type="button" style="margin-top:1rem">إغلاق</button>
+    </aside>
+    <canvas id="swarm"></canvas>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
