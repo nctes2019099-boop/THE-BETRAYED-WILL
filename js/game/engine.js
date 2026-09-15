@@ -15,7 +15,7 @@ export function createGame(world, audio) {
     place: world.places.harbor,
     map: world.maps.harbor,
     placeEntities: [],
-    player: { x: 10.5, y: 22.5, vx: 0, vy: 0, facing: 1 },
+    player: { x: 10.5, y: 22.5, vx: 0, vy: 0, facing: 1, dir: "down", moving: false },
     camera,
     mode: "play", // play | dialogue | combat | map | ending | paused
     scene: null,
@@ -208,7 +208,12 @@ export function createGame(world, audio) {
     const tryY = { x: state.player.x, y: ny };
     if (canStand(tryX.x, tryX.y)) state.player.x = tryX.x;
     if (canStand(tryY.x, tryY.y)) state.player.y = tryY.y;
-    if (axis.x || axis.y) {
+    state.player.moving = !!(axis.x || axis.y);
+    if (axis.x > 0.2) state.player.dir = "right";
+    else if (axis.x < -0.2) state.player.dir = "left";
+    else if (axis.y > 0.2) state.player.dir = "down";
+    else if (axis.y < -0.2) state.player.dir = "up";
+    if (state.player.moving) {
       state.steps += dt;
       if (state.steps > 0.32) {
         state.steps = 0;

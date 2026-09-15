@@ -15,6 +15,7 @@ button, input { font-family: inherit; }
 #game {
   position: fixed; inset: 0; width: 100%; height: 100%;
   display: block; background: #07060a;
+  image-rendering: auto;
 }
 .overlay {
   position: fixed; inset: 0; pointer-events: none;
@@ -172,8 +173,8 @@ html[dir="rtl"] #boot-bar { transform-origin: right center; }
 #end-body { max-width: 40rem; text-align: center; line-height: 1.9; }
 
 @media (max-width: 720px) {
-  #dialogue { grid-template-columns: 64px 1fr; }
-  #portrait { width: 64px; height: 80px; }
+  #dialogue { grid-template-columns: 72px 1fr; }
+  #portrait { width: 72px; height: 96px; }
   #studio { flex-direction: column; }
   #studio-side { width: 100%; height: 40%; }
   #swarm { height: 60%; width: 100%; }

@@ -53,6 +53,7 @@ export function renderDialogue(ui, game, lang) {
   ui.line.textContent = t(lang, beat);
   if (who?.portrait) {
     ui.portrait.style.backgroundImage = `url("${who.portrait}")`;
+    ui.portrait.style.backgroundSize = who.portrait.startsWith("data:") ? "contain" : "cover";
     ui.portrait.classList.remove("empty");
   } else {
     ui.portrait.style.backgroundImage = "none";

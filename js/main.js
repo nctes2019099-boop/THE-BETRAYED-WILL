@@ -14,6 +14,7 @@ import {
 } from "./ui/hud.js";
 import { AGENTS_TOTAL } from "./agents/departments.js";
 import { emptyFlags } from "./content/flags.js";
+import { loadAssets } from "./game/assets.js";
 
 const langState = { lang: "ar" };
 const screen = { id: "boot" }; // boot | title | game
